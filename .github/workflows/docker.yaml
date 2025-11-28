@@ -7,6 +7,12 @@ on:
   release:
     types:
       - published
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch or ref to run workflow against'
+        required: false
+        default: 'main'
 
 jobs:
   build-and-push:
@@ -72,6 +78,21 @@ jobs:
           context: .
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            VERSION=dev-${{ steps.build_info.outputs.short_sha }}
+          labels: ${{ steps.docker_meta.outputs.labels }}
+          tags: ${{ steps.docker_meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and Push (feature branch)
+        uses: docker/build-push-action@v6
+        if: "github.event_name == 'workflow_dispatch'"
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
           platforms: linux/amd64,linux/arm64
           build-args: |
             VERSION=dev-${{ steps.build_info.outputs.short_sha }}
