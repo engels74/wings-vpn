@@ -416,8 +416,21 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	ctx, cancel := context.WithCancel(ip.Server.Context())
 	defer cancel()
 
+	// Get config first - must be available before container.Config struct
+	cfg := config.Get()
+
+	// Only set hostname if not using container network mode.
+	// Containers sharing another container's network namespace inherit that container's hostname.
+	var hostname string
+	if !cfg.Docker.Network.IsContainerNetworkMode() {
+		hostname = "installer"
+	} else {
+		ip.Server.Log().WithField("network_mode", cfg.Docker.Network.Mode).
+			Debug("server/install: using container network mode, skipping hostname configuration")
+	}
+
 	conf := &container.Config{
-		Hostname:     "installer",
+		Hostname:     hostname,
 		AttachStdout: true,
 		AttachStderr: true,
 		AttachStdin:  true,
@@ -432,7 +445,12 @@ func (ip *InstallationProcess) Execute() (string, error) {
 		},
 	}
 
-	cfg := config.Get()
+	// DNS settings are inherited when using container network mode.
+	var dns []string
+	if !cfg.Docker.Network.IsContainerNetworkMode() {
+		dns = cfg.Docker.Network.Dns
+	}
+
 	tmpfsSize := strconv.Itoa(int(cfg.Docker.TmpfsSize))
 	hostConf := &container.HostConfig{
 		Mounts: []mount.Mount{
@@ -453,7 +471,7 @@ func (ip *InstallationProcess) Execute() (string, error) {
 		Tmpfs: map[string]string{
 			"/tmp": "rw,exec,nosuid,size=" + tmpfsSize + "M",
 		},
-		DNS:         cfg.Docker.Network.Dns,
+		DNS:         dns,
 		LogConfig:   cfg.Docker.ContainerLogConfig(),
 		NetworkMode: container.NetworkMode(cfg.Docker.Network.Mode),
 		UsernsMode:  container.UsernsMode(cfg.Docker.UsernsMode),
@@ -479,7 +497,9 @@ func (ip *InstallationProcess) Execute() (string, error) {
 
 	var netConf *network.NetworkingConfig = nil //In case when no networking config is needed set nil
 	var serverNetConfig = config.Get().Docker.Network
-	if "macvlan" == serverNetConfig.Driver { //Generate networking config for macvlan driver
+	// Skip macvlan endpoint config under container network mode: the container borrows the
+	// target container's network namespace, so attaching a macvlan endpoint would conflict.
+	if !cfg.Docker.Network.IsContainerNetworkMode() && "macvlan" == serverNetConfig.Driver { //Generate networking config for macvlan driver
 		var defaultMapping = ip.Server.Config().Allocations.DefaultMapping
 		ip.Server.Log().Debug("Set macvlan " + serverNetConfig.Name + " IP to " + defaultMapping.Ip)
 		netConf = &network.NetworkingConfig{
