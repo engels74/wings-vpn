@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -156,7 +157,13 @@ func (e *Environment) Create() error {
 
 	cfg := config.Get()
 	a := e.Configuration.Allocations()
-	evs := e.Configuration.EnvironmentVariables()
+
+	// EnvironmentVariables() hands back the Configuration's shared backing slice, so the
+	// SERVER_IP rewrite below must operate on an independent copy. Mutating the shared slice
+	// in place would race with concurrent readers (the write happens without holding the
+	// Configuration lock) and would persist the rewritten SERVER_IP into the server's stored
+	// configuration. The clone is fed directly into conf.Env so the rewrite actually takes effect.
+	evs := slices.Clone(e.Configuration.EnvironmentVariables())
 
 	// If port is 0 then we have a server with no allocation and this should stay 127.0.0.1 and not the docker network interface ip.
 	// Skip the rewrite under container network mode: the network stack is inherited from the target container, so the pelican
@@ -210,7 +217,7 @@ func (e *Environment) Create() error {
 		Tty:          true,
 		ExposedPorts: exposedPorts,
 		Image:        strings.TrimPrefix(e.meta.Image, "~"),
-		Env:          e.Configuration.EnvironmentVariables(),
+		Env:          evs,
 		Labels:       labels,
 	}
 
