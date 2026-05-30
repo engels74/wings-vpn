@@ -159,7 +159,9 @@ func (e *Environment) Create() error {
 	evs := e.Configuration.EnvironmentVariables()
 
 	// If port is 0 then we have a server with no allocation and this should stay 127.0.0.1 and not the docker network interface ip.
-	if a.DefaultMapping.Port != 0 {
+	// Skip the rewrite under container network mode: the network stack is inherited from the target container, so the pelican
+	// network interface IP does not exist in that namespace and would bind the server to a non-existent address.
+	if a.DefaultMapping.Port != 0 && !cfg.Docker.Network.IsContainerNetworkMode() {
 		for i, v := range evs {
 			// Convert 127.0.0.1 to the pelican0 network interface if the environment is Docker
 			// so that the server operates as expected.

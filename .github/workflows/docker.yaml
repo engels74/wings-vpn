@@ -99,6 +99,6 @@ jobs:
           build-args: |
             VERSION=dev-${{ steps.build_info.outputs.short_sha }}
           labels: ${{ steps.docker_meta.outputs.labels }}
-          tags: ${{ steps.docker_meta.outputs.tags }}
+          tags: ghcr.io/${{ github.repository }}:dispatch-${{ steps.build_info.outputs.short_sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
