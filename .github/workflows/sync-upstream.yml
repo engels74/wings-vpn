@@ -13,6 +13,11 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # `gh label create` calls the Issues API (POST /repos/{owner}/{repo}/labels),
+  # which the built-in GITHUB_TOKEN can only use with `issues: write`. Without
+  # it the labels are never created and the unguarded `gh pr create --label`
+  # below fails on the first run when SYNC_PAT is unset. A PAT bypasses this.
+  issues: write
 
 # Serialize runs so a manual dispatch cannot race the scheduled run. Let an
 # in-flight merge finish rather than killing it mid-commit.
@@ -85,12 +90,19 @@ jobs:
           git merge --no-edit "upstream/$UPSTREAM_BRANCH"
           code=$?
           set -e
+          # git merge exits 0 on a clean merge and 1 when there are conflicts.
+          # Any other non-zero code is a real failure (usage error, pre-existing
+          # MERGE_HEAD, a refusing hook, ...) and must NOT be silently treated as
+          # "conflicts" -- fail the step instead so it is not misattributed.
           if [ $code -eq 0 ]; then
             echo "conflicts=false" >> "$GITHUB_OUTPUT"
             echo "Merged cleanly."
-          else
+          elif [ $code -eq 1 ]; then
             echo "conflicts=true" >> "$GITHUB_OUTPUT"
             echo "Conflicts detected; handing off to the AI resolver."
+          else
+            echo "git merge failed with exit code $code (not a conflict)." >&2
+            exit $code
           fi
 
       - name: AI conflict resolution
@@ -104,9 +116,29 @@ jobs:
       - name: Complete the merge commit
         if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflicts == 'true'
         run: |
-          # AI-resolved files are already staged. Stage the rest (this may
-          # include files still containing markers -> intentionally surfaced
-          # in the PR so a human finishes them).
+          # AI-resolved files are already staged. The remaining unmerged (U)
+          # paths are the ones the resolver could not finish and emitted into
+          # FAILED_FILES. We must stage them so the merge commit succeeds and
+          # the PR opens for a human to finish (a commit with unmerged index
+          # entries would fail outright). Two categories, logged for visibility:
+          #   - text files with inline <<<<<<< markers: the human resolves the
+          #     markers in the PR.
+          #   - structural conflicts (modify/delete, rename, binary, too large):
+          #     no markers to grep for. The original blanket `git add -A` staged
+          #     these silently; we still stage them (so the PR opens) but they
+          #     are surfaced non-silently via FAILED_FILES + the needs-manual-merge
+          #     label + the PR body, which points reviewers at the job summary.
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if [ -f "$f" ] && grep -Iq '^<<<<<<<' "$f"; then
+              echo "  surfacing (inline markers): $f"
+            else
+              echo "  surfacing (structural conflict, no markers): $f"
+            fi
+          done < <(git diff --name-only --diff-filter=U)
+
+          # Stage everything (unmerged paths + any non-conflict merge changes)
+          # so the commit can complete and the PR is opened for review.
           git add -A
           git commit --no-edit
 
@@ -139,8 +171,13 @@ jobs:
               LABELS="$LABELS,needs-manual-merge"
               BODY="$BODY
 
-          ⚠️ Files still needing manual attention (search for \`<<<<<<<\`):
-          \`$FAILED_FILES\`"
+          ⚠️ Files still needing manual attention:
+          \`$FAILED_FILES\`
+
+          Not all of these contain inline \`<<<<<<<\` markers — some are structural
+          conflicts (modify/delete, rename, binary, or too-large files) with no
+          markers to search for. See the workflow run's job summary for the
+          per-file reason, and inspect each file individually."
             fi
             BODY="$BODY
 
