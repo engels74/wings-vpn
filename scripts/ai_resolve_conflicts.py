@@ -34,16 +34,42 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
+
+
+def env_int(name, default):
+    # Parse an int from the environment, falling back to the default on a
+    # malformed value. These are evaluated at import time, before main() and
+    # before any PR is opened: a bare int(...) here would raise ValueError on
+    # e.g. MAX_FILE_BYTES=foo, crash the workflow step, and -- because the
+    # downstream merge/push/PR steps are skipped when a step fails -- leave NO
+    # pull request for the human. That is the worst outcome for a workflow whose
+    # whole point is to always open a PR, so we degrade gracefully (matching the
+    # `except Exception  # never crash the merge` ethos) while still emitting a
+    # visible warning so genuine misconfiguration stays diagnosable.
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"WARNING: {name}={raw!r} is not a valid integer; "
+            f"falling back to default {default}",
+            file=sys.stderr,
+        )
+        return default
+
 
 API_BASE = os.environ.get("NANOGPT_BASE_URL", "https://nano-gpt.com/api/v1").rstrip("/")
 API_KEY = os.environ.get("NANOGPT_API_KEY", "").strip()
 MODEL = os.environ.get("NANOGPT_MODEL", "").strip()
-MAX_BYTES = int(os.environ.get("MAX_FILE_BYTES", "120000"))
+MAX_BYTES = env_int("MAX_FILE_BYTES", 120000)
 # High cap so a file near MAX_FILE_BYTES is not silently truncated by a low
 # model default. Tune down via env if a model rejects the requested ceiling.
-MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "64000"))
-TIMEOUT = int(os.environ.get("API_TIMEOUT", "180"))
-RETRIES = int(os.environ.get("API_RETRIES", "3"))
+MAX_OUTPUT_TOKENS = env_int("MAX_OUTPUT_TOKENS", 64000)
+TIMEOUT = env_int("API_TIMEOUT", 180)
+RETRIES = env_int("API_RETRIES", 3)
 
 # Unambiguous markers. We key failure detection on <<<<<<< / >>>>>>> because a
 # bare "=======" line can legitimately appear in Markdown/RST and would cause
@@ -224,12 +250,15 @@ def gh_out(name, value):
         return
     # Use the multiline heredoc form (the current GitHub standard) rather than
     # the deprecated single-line "name=value": it is the future-proof way to
-    # write the free-form failed_files list. The delimiter is a fixed token that
-    # must not appear in the value; if it ever did we would corrupt the output,
-    # so guard against it (should be impossible for our integer/path values).
-    delimiter = "ghadelimiter_ai_resolve_conflicts"
-    if delimiter in value:
-        raise ValueError(f"value for {name} contains the output delimiter")
+    # write the free-form failed_files list. The delimiter must not appear in
+    # the value, so we follow GitHub's documented recommendation and use a
+    # random per-call token; collision with our integer/path values is then
+    # impossible. We regenerate (rather than raise) on the astronomically
+    # improbable collision, so this function can never crash the workflow step
+    # and suppress the PR -- matching the file's degrade-gracefully design.
+    delimiter = f"ghadelimiter_{uuid.uuid4().hex}"
+    while delimiter in value:
+        delimiter = f"ghadelimiter_{uuid.uuid4().hex}"
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"{name}<<{delimiter}\n{value}\n{delimiter}\n")
 
