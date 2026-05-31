@@ -85,13 +85,23 @@ def user_prompt(path, content):
 
 
 def strip_fences(text):
+    # The model is told not to emit Markdown fences, but if it disobeys we only
+    # strip a fence we can prove is a *wrapper*: an opening ``` line AND a
+    # matching bare ``` as the last non-empty line. An opening fence with no
+    # closing fence is the malformed/truncated case -- we leave the text intact
+    # so the downstream empty / has_markers checks (or a human) catch it rather
+    # than silently dropping the first line and accepting a likely-corrupt body.
+    # Residual edge: a file whose real content both starts and ends with a bare
+    # ``` (e.g. a Markdown doc that is nothing but one fenced block) would be
+    # unwrapped; that is rare and acceptable versus the silent-corruption risk.
     t = text.strip()
-    if t.startswith("```"):
-        lines = t.split("\n")
-        lines = lines[1:]  # drop opening fence (e.g. ```python)
-        if lines and lines[-1].strip().startswith("```"):
-            lines = lines[:-1]
-        t = "\n".join(lines)
+    lines = t.split("\n")
+    if len(lines) >= 2 and lines[0].startswith("```"):
+        last = len(lines) - 1
+        while last > 0 and not lines[last].strip():
+            last -= 1
+        if last > 0 and lines[last].strip() == "```":
+            t = "\n".join(lines[1:last])
     return t
 
 
