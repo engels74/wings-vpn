@@ -148,6 +148,28 @@ jobs:
           # Stage everything (unmerged paths + any non-conflict merge changes)
           # so the commit can complete and the PR is opened for review.
           git add -A
+
+          # Defensive backstop: `git add -A` stages worktree content at stage 0,
+          # which clears the unmerged (U) marker for every realistic conflict type
+          # (both-modified, modify/delete, rename, add/add, binary). The only
+          # entries it CANNOT clear are exotic ones with no stage-0 worktree blob:
+          # submodule/gitlink conflicts and directory-vs-file add/add collisions.
+          # This repo has none today (no .gitmodules, no .gitattributes merge
+          # drivers, Go-only tree), but a surviving U entry would make `git commit`
+          # fail and SKIP the push/PR steps below -> no PR, breaking the
+          # always-open-a-reviewable-PR invariant. If any survive, force-resolve
+          # them so the commit proceeds; they are still surfaced to the human via
+          # FAILED_FILES + the needs-manual-merge label + the PR body.
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            echo "::warning::force-resolving unmerged path that 'git add -A' could not clear: $f"
+            if [ -e "$f" ]; then
+              git add -- "$f"
+            else
+              git rm -rf -- "$f"
+            fi
+          done < <(git diff --name-only --diff-filter=U)
+
           git commit --no-edit
 
       - name: Push sync branch

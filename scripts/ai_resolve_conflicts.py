@@ -211,7 +211,18 @@ def call_model(path, content):
             # clearer message than "list index out of range".
             if not isinstance(data.get("choices"), list) or not data["choices"]:
                 raise ValueError("empty or malformed 'choices' in API response")
-            return data["choices"][0]["message"]["content"]
+            # `choices[0]` and its `message` are still untyped here: a non-dict
+            # choice (str/None/number) makes `["message"]` raise TypeError, and a
+            # non-dict `message` makes `["content"]` raise TypeError -- neither is
+            # in the caught tuple, so it would escape the retry loop and turn a
+            # transient malformed response into a one-shot per-file failure. Guard
+            # the shape and raise ValueError to keep it on the retry path,
+            # consistent with the dict/choices guards above. A missing "content"
+            # key still raises KeyError, which is already caught/retried.
+            choice = data["choices"][0]
+            if not isinstance(choice, dict) or not isinstance(choice.get("message"), dict):
+                raise ValueError("unexpected choices[0] shape in API response")
+            return choice["message"]["content"]
         except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError) as e:
             last_err = e
             detail = ""
@@ -326,11 +337,24 @@ def main():
     # downstream merge/push/PR steps are skipped on failure, leaving NO pull
     # request. Unlikely on a healthy runner (git is present; we only reach here
     # after a merge left conflicts), but a real gap vs the never-crash invariant.
-    # Degrade like the missing-key path: WARN, emit the SAME zero outputs the
-    # `if not files:` branch emits, and exit 0 so the workflow's `git add -A`
-    # commit still opens a PR with the raw conflicts visible in the diff. A broad
-    # `except Exception` is deliberate here -- this is the top-level guard for the
-    # whole enumeration and must never let any failure suppress the PR.
+    # Degrade like the missing-key path: WARN, emit outputs, and exit 0 so the
+    # workflow's `git add -A` commit still opens a PR with the raw conflicts
+    # visible in the diff. A broad `except Exception` is deliberate here -- this
+    # is the top-level guard for the whole enumeration and must never let any
+    # failure suppress the PR.
+    #
+    # We emit a NON-zero `failed` (not the zero the `if not files:` branch emits)
+    # plus a clear sentinel `failed_files`. This is load-bearing: the workflow
+    # gates BOTH the `needs-manual-merge` label and the "⚠️ Files still needing
+    # manual attention" PR-body section on `if [ "${FAILED:-0}" != "0" ]`
+    # (.github/workflows/sync-upstream.yml). Emitting failed=0 here would open a
+    # PR that reads as if nothing needs attention even though we explicitly could
+    # not enumerate the conflicts and routed them to a human -- so we MUST report
+    # a non-zero count to fire the label + warning. Keep resolved=0 and return
+    # (exit 0): the never-crash + always-open-PR invariants are preserved. The
+    # sentinel is not a path; the workflow interpolates $FAILED_FILES as plain
+    # text inside backticks, so a prose sentinel renders fine, and gh_out's
+    # random heredoc delimiter handles any characters in it.
     try:
         files = conflicted_files()
     except Exception as e:  # noqa: BLE001 - never crash; a PR must still open
@@ -340,8 +364,8 @@ def main():
             file=sys.stderr,
         )
         gh_out("resolved", "0")
-        gh_out("failed", "0")
-        gh_out("failed_files", "")
+        gh_out("failed", "1")
+        gh_out("failed_files", "(could not enumerate conflicts — manual review required)")
         return
 
     if not files:
