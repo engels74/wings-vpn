@@ -1,0 +1,225 @@
+name: Sync upstream (AI-assisted)
+
+# Keeps engels74/wings-vpn in sync with pelican-dev/wings.
+# - Clean merges  -> opens a PR for review.
+# - Conflicts     -> NanoGPT resolves what it can, the rest is flagged in the PR.
+# Nothing is ever pushed straight to your default branch; you click merge.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch: {} # manual "Run workflow" button
+
+permissions:
+  contents: write
+  pull-requests: write
+  # `gh label create` calls the Issues API (POST /repos/{owner}/{repo}/labels),
+  # which the built-in GITHUB_TOKEN can only use with `issues: write`. Without
+  # it the labels are never created and the unguarded `gh pr create --label`
+  # below fails on the first run when SYNC_PAT is unset. NOTE: this block only
+  # caps the built-in GITHUB_TOKEN -- it has NO effect on SYNC_PAT, whose scopes
+  # are fixed at PAT creation time, so SYNC_PAT must itself carry Issues: write
+  # (see the required-scopes note on the checkout step below).
+  issues: write
+
+# Serialize runs so a manual dispatch cannot race the scheduled run. Let an
+# in-flight merge finish rather than killing it mid-commit.
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/pelican-dev/wings.git
+  UPSTREAM_BRANCH: main # <- confirm upstream's default branch name
+  TARGET_BRANCH: main # <- your fork's default branch name
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      # The model id lives in a repo secret so it can change without editing
+      # the workflow. Secrets are not readable from the top-level env block, so
+      # it is declared here at job level. Falls back to a real id if the secret
+      # is empty (the resolver sys.exits on an empty model). List valid strings:
+      #   curl https://nano-gpt.com/api/v1/models -H "Authorization: Bearer $YOUR_KEY"
+      NANOGPT_MODEL: ${{ secrets.NANOGPT_MODEL || 'moonshotai/kimi-k2-0905' }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history is required to merge
+          # A fine-grained PAT (SYNC_PAT) lets the opened PR trigger on:
+          # pull_request CI (push.yaml + codeql.yaml); the built-in
+          # GITHUB_TOKEN cannot. Falls back to GITHUB_TOKEN when unset.
+          # If SYNC_PAT is set, it needs these repository permissions:
+          #   Contents: write, Pull requests: write, Issues: write
+          # (Issues: write is required for the `gh label create` calls below;
+          # a PAT lacking it makes label creation 403/422, then the unguarded
+          # `gh pr create --label` fails on the first run.)
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch upstream --tags --prune
+
+      - name: Check how far behind we are
+        id: check
+        run: |
+          git checkout "$TARGET_BRANCH"
+          BEHIND=$(git rev-list --count "HEAD..upstream/$UPSTREAM_BRANCH")
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Fork is $BEHIND commit(s) behind upstream/$UPSTREAM_BRANCH"
+
+      - name: Create sync branch
+        if: steps.check.outputs.behind != '0'
+        id: branch
+        run: |
+          BRANCH="sync/upstream-$(date +%Y%m%d-%H%M%S)-${{ github.run_id }}-${{ github.run_attempt }}"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream
+        if: steps.check.outputs.behind != '0'
+        id: merge
+        run: |
+          set +e
+          git merge --no-edit "upstream/$UPSTREAM_BRANCH"
+          code=$?
+          set -e
+          # git merge exits 0 on a clean merge and 1 when there are conflicts.
+          # Any other non-zero code is a real failure (usage error, pre-existing
+          # MERGE_HEAD, a refusing hook, ...) and must NOT be silently treated as
+          # "conflicts" -- fail the step instead so it is not misattributed.
+          if [ $code -eq 0 ]; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+            echo "Merged cleanly."
+          elif [ $code -eq 1 ]; then
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+            echo "Conflicts detected; handing off to the AI resolver."
+          else
+            echo "git merge failed with exit code $code (not a conflict)." >&2
+            exit $code
+          fi
+
+      - name: AI conflict resolution
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflicts == 'true'
+        id: ai
+        env:
+          NANOGPT_API_KEY: ${{ secrets.NANOGPT_API_KEY }}
+          # NANOGPT_MODEL is inherited from the job-level env block.
+        run: python scripts/ai_resolve_conflicts.py
+
+      - name: Complete the merge commit
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflicts == 'true'
+        run: |
+          # AI-resolved files are already staged. The remaining unmerged (U)
+          # paths are the ones the resolver could not finish and emitted into
+          # FAILED_FILES. We must stage them so the merge commit succeeds and
+          # the PR opens for a human to finish (a commit with unmerged index
+          # entries would fail outright). Two categories, logged for visibility:
+          #   - text files with inline <<<<<<< markers: the human resolves the
+          #     markers in the PR.
+          #   - structural conflicts (modify/delete, rename, binary, too large):
+          #     no markers to grep for. The original blanket `git add -A` staged
+          #     these silently; we still stage them (so the PR opens) but they
+          #     are surfaced non-silently via FAILED_FILES + the needs-manual-merge
+          #     label + the PR body, which points reviewers at the job summary.
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if [ -f "$f" ] && grep -Iq '^<<<<<<<' -- "$f"; then
+              echo "  surfacing (inline markers): $f"
+            else
+              echo "  surfacing (structural conflict, no markers): $f"
+            fi
+          done < <(git diff --name-only --diff-filter=U)
+
+          # Stage everything (unmerged paths + any non-conflict merge changes)
+          # so the commit can complete and the PR is opened for review.
+          git add -A
+
+          # Defensive backstop: `git add -A` stages worktree content at stage 0,
+          # which clears the unmerged (U) marker for every realistic conflict type
+          # (both-modified, modify/delete, rename, add/add, binary). The only
+          # entries it CANNOT clear are exotic ones with no stage-0 worktree blob:
+          # submodule/gitlink conflicts and directory-vs-file add/add collisions.
+          # This repo has none today (no .gitmodules, no .gitattributes merge
+          # drivers, Go-only tree), but a surviving U entry would make `git commit`
+          # fail and SKIP the push/PR steps below -> no PR, breaking the
+          # always-open-a-reviewable-PR invariant. If any survive, force-resolve
+          # them so the commit proceeds; they are still surfaced to the human via
+          # FAILED_FILES + the needs-manual-merge label + the PR body.
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            echo "::warning::force-resolving unmerged path that 'git add -A' could not clear: $f"
+            if [ -e "$f" ]; then
+              git add -- "$f"
+            else
+              git rm -rf -- "$f"
+            fi
+          done < <(git diff --name-only --diff-filter=U)
+
+          git commit --no-edit
+
+      - name: Push sync branch
+        if: steps.check.outputs.behind != '0'
+        run: git push origin "${{ steps.branch.outputs.branch }}"
+
+      - name: Open pull request
+        if: steps.check.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          BEHIND: ${{ steps.check.outputs.behind }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          RESOLVED: ${{ steps.ai.outputs.resolved }}
+          FAILED: ${{ steps.ai.outputs.failed }}
+          FAILED_FILES: ${{ steps.ai.outputs.failed_files }}
+        run: |
+          # Make sure labels exist (no-op if they already do).
+          gh label create upstream-sync --color 0e8a16 --description "Automated upstream sync" 2>/dev/null || true
+          gh label create needs-manual-merge --color d93f0b --description "AI could not fully resolve conflicts" 2>/dev/null || true
+
+          LABELS="upstream-sync"
+          if [ "$CONFLICTS" = "true" ]; then
+            TITLE="Sync upstream/$UPSTREAM_BRANCH (AI-assisted, $BEHIND commits)"
+            BODY="Merged \`upstream/$UPSTREAM_BRANCH\` ($BEHIND commits behind).
+
+          **Conflicts were present.** NanoGPT ($NANOGPT_MODEL) resolved **$RESOLVED** file(s); **$FAILED** still need a human."
+            if [ "${FAILED:-0}" != "0" ]; then
+              LABELS="$LABELS,needs-manual-merge"
+              BODY="$BODY
+
+          ⚠️ Files still needing manual attention:
+          \`$FAILED_FILES\`
+
+          Not all of these contain inline \`<<<<<<<\` markers — some are structural
+          conflicts (modify/delete, rename, binary, or too-large files) with no
+          markers to search for. See the workflow run's job summary for the
+          per-file reason, and inspect each file individually."
+            fi
+            BODY="$BODY
+
+          Review the diff carefully before merging."
+          else
+            TITLE="Sync upstream/$UPSTREAM_BRANCH ($BEHIND commits, clean)"
+            BODY="Merged \`upstream/$UPSTREAM_BRANCH\` cleanly ($BEHIND commits). No conflicts."
+          fi
+
+          gh pr create \
+            --base "$TARGET_BRANCH" \
+            --head "$BRANCH" \
+            --title "$TITLE" \
+            --body "$BODY" \
+            --label "$LABELS"
