@@ -56,6 +56,14 @@ CLOSING = re.compile(r"^>{7}", re.M)
 # brackets but leaves the separator behind. Only used on the POST-call path
 # (see has_residual_conflict) -- never on the pre-call gate.
 SEPARATOR = re.compile(r"^={7}\s*$", re.M)
+# A line beginning with a Markdown code fence (three backticks). strip_fences
+# only removes a *matched* open+close wrapper; an unclosed/truncated fence or a
+# fence preceded by preamble prose survives untouched and would otherwise be
+# written into the file as literal content. Only used on the POST-call path
+# (see has_residual_conflict) -- never on the pre-call gate. Go/YAML conflict
+# files cannot legitimately contain a ``` line, and a false positive only routes
+# the file to human review (a safe direction).
+FENCE = re.compile(r"^```", re.M)
 
 SYSTEM_PROMPT = (
     "You are an expert software engineer resolving a Git merge conflict.\n"
@@ -194,6 +202,13 @@ def resolve_file(path):
         return "failed", "model returned empty output"
     if has_residual_conflict(resolved):
         return "failed", "model left conflict markers behind"
+    # strip_fences removes a matched open+close wrapper; a fence that survives
+    # here is an unclosed/truncated wrapper or one preceded by preamble prose,
+    # which would be written as literal file content. Distinct message: the
+    # failure mode differs from leftover conflict markers (aids diagnosis in the
+    # workflow's failed-files surface).
+    if FENCE.search(resolved):
+        return "failed", "model wrapped output in Markdown code fences"
 
     if not resolved.endswith("\n"):
         resolved += "\n"
