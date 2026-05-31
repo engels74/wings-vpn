@@ -94,15 +94,19 @@ def strip_fences(text):
     # Residual edge: a file whose real content both starts and ends with a bare
     # ``` (e.g. a Markdown doc that is nothing but one fenced block) would be
     # unwrapped; that is rare and acceptable versus the silent-corruption risk.
-    t = text.strip()
-    lines = t.split("\n")
+    # Detect on a stripped copy so incidental whitespace the model may add
+    # around the wrapper (e.g. a blank line before the opening fence) doesn't
+    # defeat detection. But only the *fence delimiters* are ours to remove:
+    # when there is no wrapping fence we return the ORIGINAL text untouched, so
+    # a file's own legitimate leading/trailing whitespace is never mutated.
+    lines = text.strip().split("\n")
     if len(lines) >= 2 and lines[0].startswith("```"):
         last = len(lines) - 1
         while last > 0 and not lines[last].strip():
             last -= 1
         if last > 0 and lines[last].strip() == "```":
-            t = "\n".join(lines[1:last])
-    return t
+            return "\n".join(lines[1:last])
+    return text
 
 
 def has_markers(text):
