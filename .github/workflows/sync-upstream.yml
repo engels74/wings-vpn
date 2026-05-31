@@ -138,7 +138,7 @@ jobs:
           #     label + the PR body, which points reviewers at the job summary.
           while IFS= read -r f; do
             [ -z "$f" ] && continue
-            if [ -f "$f" ] && grep -Iq '^<<<<<<<' "$f"; then
+            if [ -f "$f" ] && grep -Iq '^<<<<<<<' -- "$f"; then
               echo "  surfacing (inline markers): $f"
             else
               echo "  surfacing (structural conflict, no markers): $f"
