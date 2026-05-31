@@ -86,10 +86,17 @@ SEPARATOR = re.compile(r"^={7}\s*$", re.M)
 # only removes a *matched* open+close wrapper; an unclosed/truncated fence or a
 # fence preceded by preamble prose survives untouched and would otherwise be
 # written into the file as literal content. Only used on the POST-call path
-# (see has_residual_conflict) -- never on the pre-call gate. Go/YAML conflict
-# files cannot legitimately contain a ``` line, and a false positive only routes
-# the file to human review (a safe direction).
+# (see resolve_file) -- never on the pre-call gate, and only on NON-doc files:
+# code/config (Go, YAML, ...) conflict files cannot legitimately contain a ```
+# line, so any survivor is a genuine wrapper. Doc formats (see DOC_EXTENSIONS)
+# routinely contain balanced ``` blocks as real content, so the check is skipped
+# for them to avoid rejecting a correct resolution. A false positive on the
+# remaining files only routes to human review (a safe direction).
 FENCE = re.compile(r"^```", re.M)
+# File extensions whose legitimate content can include Markdown code fences. The
+# post-call FENCE check is skipped for these so a correctly resolved doc with
+# internal ``` blocks (e.g. AGENTS.md, CLAUDE.md) is not falsely rejected.
+DOC_EXTENSIONS = (".md", ".markdown", ".rst")
 
 SYSTEM_PROMPT = (
     "You are an expert software engineer resolving a Git merge conflict.\n"
@@ -241,8 +248,10 @@ def resolve_file(path):
     # here is an unclosed/truncated wrapper or one preceded by preamble prose,
     # which would be written as literal file content. Distinct message: the
     # failure mode differs from leftover conflict markers (aids diagnosis in the
-    # workflow's failed-files surface).
-    if FENCE.search(resolved):
+    # workflow's failed-files surface). Skip for doc formats (.md/.markdown/.rst):
+    # there a ``` is almost always real content, so the check would reject a
+    # correct resolution; for code/config files a survivor is a genuine wrapper.
+    if not path.lower().endswith(DOC_EXTENSIONS) and FENCE.search(resolved):
         return "failed", "model wrapped output in Markdown code fences"
 
     if not resolved.endswith("\n"):
