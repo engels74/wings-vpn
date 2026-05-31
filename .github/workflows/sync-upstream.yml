@@ -16,7 +16,10 @@ permissions:
   # `gh label create` calls the Issues API (POST /repos/{owner}/{repo}/labels),
   # which the built-in GITHUB_TOKEN can only use with `issues: write`. Without
   # it the labels are never created and the unguarded `gh pr create --label`
-  # below fails on the first run when SYNC_PAT is unset. A PAT bypasses this.
+  # below fails on the first run when SYNC_PAT is unset. NOTE: this block only
+  # caps the built-in GITHUB_TOKEN -- it has NO effect on SYNC_PAT, whose scopes
+  # are fixed at PAT creation time, so SYNC_PAT must itself carry Issues: write
+  # (see the required-scopes note on the checkout step below).
   issues: write
 
 # Serialize runs so a manual dispatch cannot race the scheduled run. Let an
@@ -48,6 +51,11 @@ jobs:
           # A fine-grained PAT (SYNC_PAT) lets the opened PR trigger on:
           # pull_request CI (push.yaml + codeql.yaml); the built-in
           # GITHUB_TOKEN cannot. Falls back to GITHUB_TOKEN when unset.
+          # If SYNC_PAT is set, it needs these repository permissions:
+          #   Contents: write, Pull requests: write, Issues: write
+          # (Issues: write is required for the `gh label create` calls below;
+          # a PAT lacking it makes label creation 403/422, then the unguarded
+          # `gh pr create --label` fails on the first run.)
           token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
