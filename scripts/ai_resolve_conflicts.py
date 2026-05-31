@@ -188,6 +188,15 @@ def call_model(path, content):
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+            # A present-but-empty `choices` (or a non-list) would make the index
+            # below raise IndexError/TypeError, which is NOT in the caught tuple
+            # and would escape the retry loop -- a transient empty response would
+            # then permanently route the file to a human instead of being
+            # retried. Raising ValueError keeps it on the existing retry path
+            # (an ABSENT `choices` key already retries via KeyError) and yields a
+            # clearer message than "list index out of range".
+            if not isinstance(data.get("choices"), list) or not data["choices"]:
+                raise ValueError("empty or malformed 'choices' in API response")
             return data["choices"][0]["message"]["content"]
         except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError) as e:
             last_err = e
@@ -272,10 +281,22 @@ def gh_summary(lines):
 
 
 def main():
+    # A missing key/model is operator misconfig, but exiting non-zero here would
+    # fail the step and -- because the downstream merge/push/PR steps are skipped
+    # when a step fails -- leave NO pull request, defeating this workflow's whole
+    # point. The conflicts need a human regardless, so we degrade gracefully
+    # (matching env_int / the `except Exception  # never crash the merge` ethos):
+    # skip the model calls, route every conflicted file to a human with a clear
+    # reason, emit the SAME gh_out/gh_summary outputs the normal path would, and
+    # exit 0 so the workflow still opens a needs-manual-merge PR. A visible
+    # WARNING keeps genuine misconfiguration diagnosable.
+    unavailable = None
     if not API_KEY:
-        sys.exit("NANOGPT_API_KEY is not set")
-    if not MODEL:
-        sys.exit("NANOGPT_MODEL is not set (e.g. moonshotai/kimi-k2-0905)")
+        unavailable = "AI resolver unavailable: NANOGPT_API_KEY not set"
+    elif not MODEL:
+        unavailable = "AI resolver unavailable: NANOGPT_MODEL not set"
+    if unavailable:
+        print(f"WARNING: {unavailable}; routing all conflicts to a human.", file=sys.stderr)
 
     files = conflicted_files()
     if not files:
@@ -290,10 +311,13 @@ def main():
     resolved, need_human = [], []
     for path in files:
         print(f"-> {path}")
-        try:
-            status, note = resolve_file(path)
-        except Exception as e:  # noqa: BLE001 - never crash the merge
-            status, note = "failed", str(e)
+        if unavailable:
+            status, note = "failed", unavailable
+        else:
+            try:
+                status, note = resolve_file(path)
+            except Exception as e:  # noqa: BLE001 - never crash the merge
+                status, note = "failed", str(e)
         print(f"   [{status}] {note}")
         if status == "resolved":
             resolved.append(path)
