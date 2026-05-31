@@ -195,6 +195,13 @@ def call_model(path, content):
         try:
             with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+            # `json.loads` can yield any JSON type; a non-object body (scalar,
+            # array, or null from a proxy/CDN) would make `data.get` below raise
+            # AttributeError, which is NOT in the caught tuple and would escape
+            # the retry loop. Raise ValueError instead to keep it on the retry
+            # path, consistent with the `choices` guard.
+            if not isinstance(data, dict):
+                raise ValueError("non-object API response")
             # A present-but-empty `choices` (or a non-list) would make the index
             # below raise IndexError/TypeError, which is NOT in the caught tuple
             # and would escape the retry loop -- a transient empty response would

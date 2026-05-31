@@ -86,7 +86,7 @@ jobs:
         if: steps.check.outputs.behind != '0'
         id: branch
         run: |
-          BRANCH="sync/upstream-$(date +%Y%m%d-%H%M%S)"
+          BRANCH="sync/upstream-$(date +%Y%m%d-%H%M%S)-${{ github.run_id }}-${{ github.run_attempt }}"
           git checkout -b "$BRANCH"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
