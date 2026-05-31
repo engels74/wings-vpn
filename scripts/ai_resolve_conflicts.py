@@ -50,6 +50,12 @@ RETRIES = int(os.environ.get("API_RETRIES", "3"))
 # false positives.
 OPENING = re.compile(r"^<{7}", re.M)
 CLOSING = re.compile(r"^>{7}", re.M)
+# A line that is EXACTLY the git default conflict separator (seven '=' and
+# nothing else). Narrow enough that a Markdown/RST setext underline of arbitrary
+# length does not match, yet it still catches a model that deletes the angle
+# brackets but leaves the separator behind. Only used on the POST-call path
+# (see has_residual_conflict) -- never on the pre-call gate.
+SEPARATOR = re.compile(r"^={7}\s*$", re.M)
 
 SYSTEM_PROMPT = (
     "You are an expert software engineer resolving a Git merge conflict.\n"
@@ -111,6 +117,15 @@ def strip_fences(text):
 
 def has_markers(text):
     return bool(OPENING.search(text) or CLOSING.search(text))
+
+
+def has_residual_conflict(text):
+    # Post-call validation only. Reuses has_markers (the angle brackets) and
+    # additionally rejects a lone surviving separator line. Matching "=======*"
+    # here is safe because a false positive only routes the file to human
+    # review (a safe direction), unlike the pre-call gate where it would waste
+    # a model call on a non-conflicted doc.
+    return has_markers(text) or bool(SEPARATOR.search(text))
 
 
 def call_model(path, content):
@@ -177,7 +192,7 @@ def resolve_file(path):
 
     if not resolved.strip():
         return "failed", "model returned empty output"
-    if has_markers(resolved):
+    if has_residual_conflict(resolved):
         return "failed", "model left conflict markers behind"
 
     if not resolved.endswith("\n"):
@@ -192,8 +207,16 @@ def gh_out(name, value):
     path = os.environ.get("GITHUB_OUTPUT")
     if not path:
         return
+    # Use the multiline heredoc form (the current GitHub standard) rather than
+    # the deprecated single-line "name=value": it is the future-proof way to
+    # write the free-form failed_files list. The delimiter is a fixed token that
+    # must not appear in the value; if it ever did we would corrupt the output,
+    # so guard against it (should be impossible for our integer/path values).
+    delimiter = "ghadelimiter_ai_resolve_conflicts"
+    if delimiter in value:
+        raise ValueError(f"value for {name} contains the output delimiter")
     with open(path, "a", encoding="utf-8") as f:
-        f.write(f"{name}={value}\n")
+        f.write(f"{name}<<{delimiter}\n{value}\n{delimiter}\n")
 
 
 def gh_summary(lines):
