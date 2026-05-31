@@ -223,12 +223,18 @@ def resolve_file(path):
     """Return (status, note). status in {'resolved','skipped','failed'}."""
     try:
         with open(path, "rb") as f:
-            raw = f.read()
+            # Bounded read: cap memory at MAX_BYTES+1 so an oversized file is
+            # detected (len(raw) > MAX_BYTES) WITHOUT allocating the whole thing.
+            # Reading the full file before the size gate would defeat the gate's
+            # OOM-avoidance purpose on a multi-GB blob. The +1 byte is enough to
+            # prove the file exceeds the limit; we no longer know the exact size,
+            # so the skip note reports the threshold rather than a byte count.
+            raw = f.read(MAX_BYTES + 1)
     except FileNotFoundError:
         return "skipped", "file missing (delete/rename conflict)"
 
     if len(raw) > MAX_BYTES:
-        return "skipped", f"too large ({len(raw)} bytes > {MAX_BYTES})"
+        return "skipped", f"too large (> {MAX_BYTES} bytes)"
 
     try:
         content = raw.decode("utf-8")
@@ -307,7 +313,30 @@ def main():
     if unavailable:
         print(f"WARNING: {unavailable}; routing all conflicts to a human.", file=sys.stderr)
 
-    files = conflicted_files()
+    # Enumerating conflicts shells out to git via run() (check=True), so a
+    # CalledProcessError, or a missing git binary (FileNotFoundError/OSError),
+    # would raise and exit non-zero -- failing the step and, because the
+    # downstream merge/push/PR steps are skipped on failure, leaving NO pull
+    # request. Unlikely on a healthy runner (git is present; we only reach here
+    # after a merge left conflicts), but a real gap vs the never-crash invariant.
+    # Degrade like the missing-key path: WARN, emit the SAME zero outputs the
+    # `if not files:` branch emits, and exit 0 so the workflow's `git add -A`
+    # commit still opens a PR with the raw conflicts visible in the diff. A broad
+    # `except Exception` is deliberate here -- this is the top-level guard for the
+    # whole enumeration and must never let any failure suppress the PR.
+    try:
+        files = conflicted_files()
+    except Exception as e:  # noqa: BLE001 - never crash; a PR must still open
+        print(
+            f"WARNING: could not enumerate conflicted files ({e}); "
+            f"opening a PR with the raw conflict state for a human.",
+            file=sys.stderr,
+        )
+        gh_out("resolved", "0")
+        gh_out("failed", "0")
+        gh_out("failed_files", "")
+        return
+
     if not files:
         print("No conflicted files found.")
         gh_out("resolved", "0")
