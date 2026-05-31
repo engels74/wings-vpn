@@ -1,0 +1,158 @@
+name: Sync upstream (AI-assisted)
+
+# Keeps engels74/wings-vpn in sync with pelican-dev/wings.
+# - Clean merges  -> opens a PR for review.
+# - Conflicts     -> NanoGPT resolves what it can, the rest is flagged in the PR.
+# Nothing is ever pushed straight to your default branch; you click merge.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch: {} # manual "Run workflow" button
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Serialize runs so a manual dispatch cannot race the scheduled run. Let an
+# in-flight merge finish rather than killing it mid-commit.
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/pelican-dev/wings.git
+  UPSTREAM_BRANCH: main # <- confirm upstream's default branch name
+  TARGET_BRANCH: main # <- your fork's default branch name
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      # The model id lives in a repo secret so it can change without editing
+      # the workflow. Secrets are not readable from the top-level env block, so
+      # it is declared here at job level. Falls back to a real id if the secret
+      # is empty (the resolver sys.exits on an empty model). List valid strings:
+      #   curl https://nano-gpt.com/api/v1/models -H "Authorization: Bearer $YOUR_KEY"
+      NANOGPT_MODEL: ${{ secrets.NANOGPT_MODEL || 'moonshotai/kimi-k2-0905' }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history is required to merge
+          # A fine-grained PAT (SYNC_PAT) lets the opened PR trigger on:
+          # pull_request CI (push.yaml + codeql.yaml); the built-in
+          # GITHUB_TOKEN cannot. Falls back to GITHUB_TOKEN when unset.
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch upstream --tags --prune
+
+      - name: Check how far behind we are
+        id: check
+        run: |
+          git checkout "$TARGET_BRANCH"
+          BEHIND=$(git rev-list --count "HEAD..upstream/$UPSTREAM_BRANCH")
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Fork is $BEHIND commit(s) behind upstream/$UPSTREAM_BRANCH"
+
+      - name: Create sync branch
+        if: steps.check.outputs.behind != '0'
+        id: branch
+        run: |
+          BRANCH="sync/upstream-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Merge upstream
+        if: steps.check.outputs.behind != '0'
+        id: merge
+        run: |
+          set +e
+          git merge --no-edit "upstream/$UPSTREAM_BRANCH"
+          code=$?
+          set -e
+          if [ $code -eq 0 ]; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+            echo "Merged cleanly."
+          else
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+            echo "Conflicts detected; handing off to the AI resolver."
+          fi
+
+      - name: AI conflict resolution
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflicts == 'true'
+        id: ai
+        env:
+          NANOGPT_API_KEY: ${{ secrets.NANOGPT_API_KEY }}
+          # NANOGPT_MODEL is inherited from the job-level env block.
+        run: python scripts/ai_resolve_conflicts.py
+
+      - name: Complete the merge commit
+        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflicts == 'true'
+        run: |
+          # AI-resolved files are already staged. Stage the rest (this may
+          # include files still containing markers -> intentionally surfaced
+          # in the PR so a human finishes them).
+          git add -A
+          git commit --no-edit
+
+      - name: Push sync branch
+        if: steps.check.outputs.behind != '0'
+        run: git push origin "${{ steps.branch.outputs.branch }}"
+
+      - name: Open pull request
+        if: steps.check.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          BEHIND: ${{ steps.check.outputs.behind }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          RESOLVED: ${{ steps.ai.outputs.resolved }}
+          FAILED: ${{ steps.ai.outputs.failed }}
+          FAILED_FILES: ${{ steps.ai.outputs.failed_files }}
+        run: |
+          # Make sure labels exist (no-op if they already do).
+          gh label create upstream-sync --color 0e8a16 --description "Automated upstream sync" 2>/dev/null || true
+          gh label create needs-manual-merge --color d93f0b --description "AI could not fully resolve conflicts" 2>/dev/null || true
+
+          LABELS="upstream-sync"
+          if [ "$CONFLICTS" = "true" ]; then
+            TITLE="Sync upstream/$UPSTREAM_BRANCH (AI-assisted, $BEHIND commits)"
+            BODY="Merged \`upstream/$UPSTREAM_BRANCH\` ($BEHIND commits behind).
+
+          **Conflicts were present.** NanoGPT ($NANOGPT_MODEL) resolved **$RESOLVED** file(s); **$FAILED** still need a human."
+            if [ "${FAILED:-0}" != "0" ]; then
+              LABELS="$LABELS,needs-manual-merge"
+              BODY="$BODY
+
+          ⚠️ Files still needing manual attention (search for \`<<<<<<<\`):
+          \`$FAILED_FILES\`"
+            fi
+            BODY="$BODY
+
+          Review the diff carefully before merging."
+          else
+            TITLE="Sync upstream/$UPSTREAM_BRANCH ($BEHIND commits, clean)"
+            BODY="Merged \`upstream/$UPSTREAM_BRANCH\` cleanly ($BEHIND commits). No conflicts."
+          fi
+
+          gh pr create \
+            --base "$TARGET_BRANCH" \
+            --head "$BRANCH" \
+            --title "$TITLE" \
+            --body "$BODY" \
+            --label "$LABELS"

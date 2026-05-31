@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""Resolve git merge conflicts using NanoGPT's OpenAI-compatible API.
+
+Run this AFTER a `git merge` that produced conflicts. It will:
+  1. find conflicted files            (git diff --name-only --diff-filter=U)
+  2. send each one to the model and ask for a fully resolved version
+  3. validate the result (no leftover conflict markers) and write it back
+  4. `git add` the files it successfully resolved
+  5. report a summary to stdout, $GITHUB_STEP_SUMMARY and $GITHUB_OUTPUT
+
+Files it will NOT touch (and instead flags for a human):
+  - binary / non-UTF-8 files
+  - files larger than MAX_FILE_BYTES (avoids truncated model output)
+  - delete/modify or rename conflicts (no inline <<<<<<< markers to resolve)
+  - files where the model left conflict markers behind or returned nothing
+
+Only stdlib is used, so the workflow needs no `pip install`.
+
+Environment variables:
+  NANOGPT_API_KEY    (required)  your NanoGPT key
+  NANOGPT_MODEL      (required)  e.g. "moonshotai/kimi-k2-0905" -- see README
+  NANOGPT_BASE_URL   (optional)  default https://nano-gpt.com/api/v1
+  MAX_FILE_BYTES     (optional)  default 120000
+  MAX_OUTPUT_TOKENS  (optional)  max_tokens cap sent to the API, default 64000
+  API_TIMEOUT        (optional)  seconds, default 180
+  API_RETRIES        (optional)  default 3
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+API_BASE = os.environ.get("NANOGPT_BASE_URL", "https://nano-gpt.com/api/v1").rstrip("/")
+API_KEY = os.environ.get("NANOGPT_API_KEY", "").strip()
+MODEL = os.environ.get("NANOGPT_MODEL", "").strip()
+MAX_BYTES = int(os.environ.get("MAX_FILE_BYTES", "120000"))
+# High cap so a file near MAX_FILE_BYTES is not silently truncated by a low
+# model default. Tune down via env if a model rejects the requested ceiling.
+MAX_OUTPUT_TOKENS = int(os.environ.get("MAX_OUTPUT_TOKENS", "64000"))
+TIMEOUT = int(os.environ.get("API_TIMEOUT", "180"))
+RETRIES = int(os.environ.get("API_RETRIES", "3"))
+
+# Unambiguous markers. We key failure detection on <<<<<<< / >>>>>>> because a
+# bare "=======" line can legitimately appear in Markdown/RST and would cause
+# false positives.
+OPENING = re.compile(r"^<{7}", re.M)
+CLOSING = re.compile(r"^>{7}", re.M)
+
+SYSTEM_PROMPT = (
+    "You are an expert software engineer resolving a Git merge conflict.\n"
+    "You will receive the full contents of ONE file that still contains Git "
+    "conflict markers (<<<<<<<, =======, >>>>>>>).\n"
+    "The side marked HEAD / 'ours' belongs to a FORK that adds VPN-specific "
+    "functionality on top of the original project. The incoming side ('theirs') "
+    "comes from the UPSTREAM project.\n"
+    "Resolve every conflict by integrating the upstream changes while preserving "
+    "the fork's intentional modifications. When both sides changed the same "
+    "logic, combine them so neither intent is lost. Keep the code correct and "
+    "compilable.\n"
+    "Output ONLY the complete, final file content. No explanations, no commentary, "
+    "no Markdown code fences. There must be zero remaining conflict markers."
+)
+
+
+def run(args):
+    return subprocess.run(args, capture_output=True, text=True, check=True).stdout
+
+
+def conflicted_files():
+    out = run(["git", "diff", "--name-only", "--diff-filter=U"])
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def user_prompt(path, content):
+    return (
+        f"Resolve all merge conflicts in this file.\n\n"
+        f"File path: {path}\n\n"
+        f"----- BEGIN FILE -----\n{content}\n----- END FILE -----"
+    )
+
+
+def strip_fences(text):
+    t = text.strip()
+    if t.startswith("```"):
+        lines = t.split("\n")
+        lines = lines[1:]  # drop opening fence (e.g. ```python)
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        t = "\n".join(lines)
+    return t
+
+
+def has_markers(text):
+    return bool(OPENING.search(text) or CLOSING.search(text))
+
+
+def call_model(path, content):
+    body = json.dumps({
+        "model": MODEL,
+        "temperature": 0,
+        "max_tokens": MAX_OUTPUT_TOKENS,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt(path, content)},
+        ],
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{API_BASE}/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    last_err = None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            return data["choices"][0]["message"]["content"]
+        except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError) as e:
+            last_err = e
+            detail = ""
+            if isinstance(e, urllib.error.HTTPError):
+                try:
+                    detail = e.read().decode("utf-8")[:500]
+                except Exception:
+                    pass
+            print(f"  attempt {attempt}/{RETRIES} failed: {e} {detail}", file=sys.stderr)
+            if attempt < RETRIES:
+                time.sleep(2 * attempt)
+    raise RuntimeError(f"model call failed for {path}: {last_err}")
+
+
+def resolve_file(path):
+    """Return (status, note). status in {'resolved','skipped','failed'}."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return "skipped", "file missing (delete/rename conflict)"
+
+    if len(raw) > MAX_BYTES:
+        return "skipped", f"too large ({len(raw)} bytes > {MAX_BYTES})"
+
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "skipped", "binary / non-UTF-8 file"
+
+    if not has_markers(content):
+        return "skipped", "no inline conflict markers (delete/modify conflict?)"
+
+    resolved = strip_fences(call_model(path, content))
+
+    if not resolved.strip():
+        return "failed", "model returned empty output"
+    if has_markers(resolved):
+        return "failed", "model left conflict markers behind"
+
+    if not resolved.endswith("\n"):
+        resolved += "\n"
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(resolved)
+    run(["git", "add", "--", path])
+    return "resolved", "resolved by model"
+
+
+def gh_out(name, value):
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{name}={value}\n")
+
+
+def gh_summary(lines):
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def main():
+    if not API_KEY:
+        sys.exit("NANOGPT_API_KEY is not set")
+    if not MODEL:
+        sys.exit("NANOGPT_MODEL is not set (e.g. moonshotai/kimi-k2-0905)")
+
+    files = conflicted_files()
+    if not files:
+        print("No conflicted files found.")
+        gh_out("resolved", "0")
+        gh_out("failed", "0")
+        gh_out("failed_files", "")
+        return
+
+    print(f"Conflicted files ({len(files)}): {', '.join(files)}")
+
+    resolved, need_human = [], []
+    for path in files:
+        print(f"-> {path}")
+        try:
+            status, note = resolve_file(path)
+        except Exception as e:  # noqa: BLE001 - never crash the merge
+            status, note = "failed", str(e)
+        print(f"   [{status}] {note}")
+        if status == "resolved":
+            resolved.append(path)
+        else:
+            need_human.append((path, note))
+
+    gh_out("resolved", str(len(resolved)))
+    gh_out("failed", str(len(need_human)))
+    gh_out("failed_files", ",".join(p for p, _ in need_human))
+
+    summary = ["### AI conflict resolution", ""]
+    summary.append(f"- Resolved by model: **{len(resolved)}**")
+    summary.append(f"- Need a human: **{len(need_human)}**")
+    if resolved:
+        summary += ["", "**Resolved:**"] + [f"- `{p}`" for p in resolved]
+    if need_human:
+        summary += ["", "**Left for you to finish:**"] + [
+            f"- `{p}` — {note}" for p, note in need_human
+        ]
+    gh_summary(summary)
+    print("\n".join(summary))
+
+
+if __name__ == "__main__":
+    main()
