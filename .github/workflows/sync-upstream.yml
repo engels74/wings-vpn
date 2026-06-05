@@ -125,7 +125,14 @@ jobs:
           MT_OUT=$(git merge-tree --write-tree HEAD "upstream/$UPSTREAM_BRANCH")
           mt_code=$?
           set -e
-          MERGED_TREE=$(printf '%s\n' "$MT_OUT" | head -n1)   # clean output is a single line: the tree OID
+          # Pure-bash first-line extraction (strip from the first newline on).
+          # Avoids a `| head -n1` pipe: with the runner's ambient pipefail+errexit,
+          # head closing the read end after line 1 can SIGPIPE the upstream writer
+          # (exit 141), and pipefail would then abort the step before the conflict
+          # branch runs. Single-line clean output => whole string (the tree OID);
+          # multi-line conflict output => first line. No trailing newline added, so
+          # the MERGED_TREE==HEAD_TREE clean-case comparison stays exact.
+          MERGED_TREE=${MT_OUT%%$'\n'*}
 
           if [ "$mt_code" -eq 0 ] && [ "$MERGED_TREE" = "$HEAD_TREE" ]; then
             # Clean merge that changes nothing => content already present via a
