@@ -303,6 +303,10 @@ def sanitize_metadata(title: str, body: str) -> tuple[str, str]:
     title = " ".join(strip_emoji_and_controls(title).split()) or fallback_title
     body = neutralize_issue_closers(strip_emoji_and_controls(body)) or fallback_body
 
+    # These caps (100/1800) are deliberate safety ceilings, intentionally wider
+    # than the model's 80/900 prompt targets (see SYSTEM_PROMPT): the prompt
+    # guides typical length, while these hard limits only truncate true outliers
+    # without over-truncating legitimately longer titles/bodies.
     if len(title) > 100:
         title = title[:97].rstrip() + "..."
     if len(body) > 1800:
