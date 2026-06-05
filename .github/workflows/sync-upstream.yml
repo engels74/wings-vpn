@@ -1,0 +1,451 @@
+name: Sync upstream (AI-assisted)
+
+# Keeps engels74/wings-vpn in sync with pelican-dev/wings.
+# - Clean merges  -> auto-merged straight to your default branch, validated
+#                    post-merge by push.yaml CI (no PR, no AI).
+# - Conflicts     -> NanoGPT resolves what it can, the rest is flagged in a
+#                    single AI-assisted PR (deduped while one is already open).
+# Nothing is pushed to your default branch when conflicts exist; you click merge.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays 06:00 UTC
+  workflow_dispatch: {} # manual "Run workflow" button
+
+permissions:
+  contents: write
+  pull-requests: write
+  # `gh label create` calls the Issues API (POST /repos/{owner}/{repo}/labels),
+  # which the built-in GITHUB_TOKEN can only use with `issues: write`. Without
+  # it the labels are never created and the unguarded `gh pr create --label`
+  # below fails on the first run when SYNC_PAT is unset. NOTE: this block only
+  # caps the built-in GITHUB_TOKEN -- it has NO effect on SYNC_PAT, whose scopes
+  # are fixed at PAT creation time, so SYNC_PAT must itself carry Issues: write
+  # (see the required-scopes note on the checkout step below).
+  issues: write
+
+# Serialize runs so a manual dispatch cannot race the scheduled run. Let an
+# in-flight merge finish rather than killing it mid-commit.
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/pelican-dev/wings.git
+  UPSTREAM_BRANCH: main # <- confirm upstream's default branch name
+  TARGET_BRANCH: main # <- your fork's default branch name
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      # The model id lives in a repo secret so it can change without editing
+      # the workflow. Secrets are not readable from the top-level env block, so
+      # it is declared here at job level. Falls back to a real id if the secret
+      # is empty (the resolver sys.exits on an empty model). List valid strings:
+      #   curl https://nano-gpt.com/api/v1/models -H "Authorization: Bearer $YOUR_KEY"
+      NANOGPT_MODEL: ${{ secrets.NANOGPT_MODEL || 'moonshotai/kimi-k2-0905' }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history is required to merge
+          # A fine-grained PAT (SYNC_PAT) lets the opened PR trigger on:
+          # pull_request CI (push.yaml + codeql.yaml); the built-in
+          # GITHUB_TOKEN cannot. Falls back to GITHUB_TOKEN when unset.
+          # If SYNC_PAT is set, it needs these repository permissions:
+          #   Contents: write, Pull requests: write, Issues: write
+          # (Issues: write is required for the `gh label create` calls below;
+          # a PAT lacking it makes label creation 403/422, then the unguarded
+          # `gh pr create --label` fails on the first run.)
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream "$UPSTREAM_REPO" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_REPO"
+          git fetch upstream --tags --prune
+
+      - name: Check how far behind we are
+        id: check
+        run: |
+          git checkout "$TARGET_BRANCH"
+          # `|| echo 0` would mask a rev-list failure (e.g. a broken/missing
+          # upstream/$UPSTREAM_BRANCH ref or a partial fetch) as "0 behind",
+          # which then propagates into the behind output, the logs, and the PR
+          # metadata as a misleading "up to date". Capture the real exit code and
+          # fail loudly so a broken ref/repo state is surfaced, not swallowed.
+          set +e
+          BEHIND=$(git rev-list --count "HEAD..upstream/$UPSTREAM_BRANCH")
+          rl_code=$?
+          set -e
+          if [ "$rl_code" -ne 0 ]; then
+            echo "::error::git rev-list failed (exit $rl_code) computing commits behind upstream/$UPSTREAM_BRANCH. The ref may be broken/missing or the fetch was incomplete." >&2
+            exit "$rl_code"
+          fi
+          HEAD_TREE=$(git rev-parse "HEAD^{tree}")
+
+          # Tier 1 -- fast ancestor check. If upstream is already an ancestor of
+          # HEAD, every upstream commit is reachable from main => nothing to sync.
+          # This catches all *clean-path* drift cheaply: clean auto-merges push a
+          # real merge commit, making upstream an ancestor on the next run. errexit
+          # does NOT apply to the command in an `if` condition, so a non-ancestor
+          # (exit 1) is handled here, not treated as a step failure.
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            {
+              echo "sync_needed=false"
+              echo "conflicts=false"
+              echo "behind=$BEHIND"
+            } >> "$GITHUB_OUTPUT"
+            echo "Up to date (upstream is an ancestor of $TARGET_BRANCH)."
+            exit 0
+          fi
+
+          # Tier 2 -- squash-proof content check. Tier 1 does NOT catch a
+          # squash-merged conflict PR (squash drops the parent edge, so upstream
+          # is not an ancestor even though its content is present). Run a real
+          # 3-way merge against the merge-base and compare the resulting tree to
+          # HEAD's tree. Equal => content already present => no-op. Capture WITHOUT
+          # a pipe so $? is merge-tree's, not head's.
+          # (`git merge-tree --write-tree` needs git >= 2.38; ubuntu-latest ships >= 2.43.)
+          # Exit codes: 0 = clean merge, 1 = merge conflicts, >1 = a real error
+          # (bad usage, not a repo, missing object, ...). Keep stderr so a real
+          # error is diagnosable instead of silently swallowed.
+          set +e
+          MT_OUT=$(git merge-tree --write-tree HEAD "upstream/$UPSTREAM_BRANCH")
+          mt_code=$?
+          set -e
+          # Pure-bash first-line extraction (strip from the first newline on).
+          # Avoids a `| head -n1` pipe: with the runner's ambient pipefail+errexit,
+          # head closing the read end after line 1 can SIGPIPE the upstream writer
+          # (exit 141), and pipefail would then abort the step before the conflict
+          # branch runs. Single-line clean output => whole string (the tree OID);
+          # multi-line conflict output => first line. No trailing newline added, so
+          # the MERGED_TREE==HEAD_TREE clean-case comparison stays exact.
+          MERGED_TREE=${MT_OUT%%$'\n'*}
+
+          if [ "$mt_code" -eq 0 ] && [ "$MERGED_TREE" = "$HEAD_TREE" ]; then
+            # Clean merge that changes nothing => content already present via a
+            # prior squash merge. Nothing to sync.
+            echo "sync_needed=false" >> "$GITHUB_OUTPUT"
+            echo "conflicts=false"   >> "$GITHUB_OUTPUT"
+            echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+            # $BEHIND is commit-graph-based; the content-equivalence gate just
+            # decided upstream's changes are already present (prior squash merge),
+            # so do NOT claim we are "behind" -- that would be misleading.
+            echo "Upstream content already present (squash-merged); $BEHIND commit(s) apart in the graph but nothing to sync."
+            exit 0
+          elif [ "$mt_code" -eq 0 ]; then
+            echo "sync_needed=true"  >> "$GITHUB_OUTPUT"
+            echo "conflicts=false"   >> "$GITHUB_OUTPUT"   # clean, with real changes
+          elif [ "$mt_code" -eq 1 ]; then
+            echo "sync_needed=true"  >> "$GITHUB_OUTPUT"
+            echo "conflicts=true"    >> "$GITHUB_OUTPUT"    # genuine merge conflicts
+            # merge-tree wrote its conflict report (conflicted-file stage list +
+            # "CONFLICT ..." lines) to stdout, captured in MT_OUT. Echo it so the
+            # log shows WHICH paths conflicted instead of just "conflicts=true".
+            printf '%s\n' "$MT_OUT"
+          else
+            # Exit >1 is a real merge-tree failure, NOT a conflict. Misclassifying
+            # it as conflicts=true would route to the AI/PR path and hide the root
+            # cause; fail the step instead so it is not misattributed.
+            echo "git merge-tree failed with exit code $mt_code (not a conflict)." >&2
+            exit "$mt_code"
+          fi
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo "Fork is $BEHIND commit(s) behind upstream/$UPSTREAM_BRANCH"
+
+      - name: Clean merge to default branch
+        if: steps.check.outputs.sync_needed == 'true' && steps.check.outputs.conflicts == 'false'
+        id: clean_merge
+        run: |
+          git checkout "$TARGET_BRANCH"
+          BASE=$(git rev-parse HEAD)
+          git merge --no-edit -m "sync upstream/$UPSTREAM_BRANCH (clean auto-merge)" "upstream/$UPSTREAM_BRANCH"
+          # Belt-and-suspenders backstop (expected never to fire). The Tier-2 gate
+          # already excludes the empty-merge case: we only reach here when
+          # MERGED_TREE != HEAD_TREE, so a clean real merge necessarily changes
+          # content. This guard can only trip if merge-tree and the real merge
+          # disagree on the result tree (worktree hooks / gitattributes merge
+          # drivers that merge-tree bypasses) -- this repo has none (Go-only, no
+          # .gitattributes drivers). Keep it as a defense, but do NOT treat it as
+          # the primary divergence guard.
+          if git diff --quiet "$BASE" HEAD; then
+            echo "No content change after merge; nothing to push."
+            exit 0
+          fi
+
+          # The push can be rejected non-fast-forward if a human advanced
+          # origin/$TARGET_BRANCH after this job's checkout (line ~153). A blind
+          # --force would clobber that human commit, so instead: on rejection,
+          # fetch the advanced target and merge it INTO our sync result, then
+          # retry once. This preserves the human's work. If the retry also
+          # fails, hard-fail loudly rather than loop or force.
+          set +e
+          git push origin "HEAD:$TARGET_BRANCH"
+          push_code=$?
+          set -e
+          if [ "$push_code" -ne 0 ]; then
+            echo "::warning::push to $TARGET_BRANCH was rejected (likely non-fast-forward: the branch advanced during this run). Fetching and re-merging the advanced target, then retrying once."
+            git fetch origin "$TARGET_BRANCH"
+            # Merge the advanced remote tip into our sync result. If a human's
+            # change conflicts with the upstream sync, fail loudly: this path is
+            # for clean syncs only, and a conflict here needs human attention.
+            git merge --no-edit -m "merge concurrent $TARGET_BRANCH advance into upstream sync" "origin/$TARGET_BRANCH"
+            git push origin "HEAD:$TARGET_BRANCH"
+          fi
+
+      - name: Create sync branch
+        if: steps.check.outputs.conflicts == 'true'
+        id: branch
+        run: |
+          BRANCH="sync/upstream-$(date +%Y%m%d-%H%M%S)-${{ github.run_id }}-${{ github.run_attempt }}"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Dedupe open sync PRs
+        if: steps.check.outputs.conflicts == 'true'
+        id: dedupe
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          # Same fork gotcha as "Open pull request": pin gh to this fork so
+          # `gh pr list` probes origin, not pelican-dev/wings.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Run BEFORE the expensive merge/AI/commit steps so a run that will be
+          # skipped (a sync PR is already open) short-circuits cheaply -- it never
+          # burns NanoGPT quota and cannot fail mid-merge. This check depends only
+          # on $TARGET_BRANCH + the fork's PR list, none of which is produced by the
+          # merge/AI/commit steps, so hoisting it does not change its result.
+          #
+          # Match the unconditional `sync/upstream-*` branch naming, NOT the
+          # `upstream-sync` label: the label is attached inside `Open pull request`
+          # and can fail to attach, making a label-keyed query miss a prior PR and
+          # re-open a duplicate. headRefName is set at branch creation and is
+          # always present.
+          # Distinguish "no open PRs" from "the query itself failed". A blanket
+          # `|| open_count=0` would silently treat an auth/rate-limit/CLI failure
+          # as "no PR open" and re-enable duplicate PR creation with no warning.
+          set +e
+          open_count="$(gh pr list --state open --base "$TARGET_BRANCH" --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))] | length')"
+          gh_code=$?
+          set -e
+          if [ "$gh_code" -ne 0 ]; then
+            echo "::warning::\`gh pr list\` failed (exit $gh_code); cannot verify whether a sync PR is already open. Skipping to avoid opening a possible duplicate -- re-run once the gh/API issue clears."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "${open_count:-0}" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            # Surface loudly: skip-if-open means an ABANDONED open PR would otherwise
+            # pause syncs silently and indefinitely. Annotate so it shows in the
+            # Actions UI, not just the step summary.
+            echo "::warning::An upstream-sync PR is already open against $TARGET_BRANCH; skipping a duplicate. If that PR is stale/abandoned, syncs stay PAUSED until it is merged or closed."
+            echo "An upstream-sync PR is already open; not opening a duplicate." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream
+        if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true'
+        id: merge
+        run: |
+          set +e
+          git merge --no-edit -m "sync upstream/$UPSTREAM_BRANCH" "upstream/$UPSTREAM_BRANCH"
+          code=$?
+          set -e
+          # git merge exits 0 on a clean merge and 1 when there are conflicts.
+          # Any other non-zero code is a real failure (usage error, pre-existing
+          # MERGE_HEAD, a refusing hook, ...) and must NOT be silently treated as
+          # "conflicts" -- fail the step instead so it is not misattributed.
+          if [ $code -eq 0 ]; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+            echo "Merged cleanly."
+          elif [ $code -eq 1 ]; then
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+            echo "Conflicts detected; handing off to the AI resolver."
+          else
+            echo "git merge failed with exit code $code (not a conflict)." >&2
+            exit $code
+          fi
+
+      - name: AI conflict resolution
+        if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true' && steps.merge.outputs.conflicts == 'true'
+        id: ai
+        env:
+          NANOGPT_API_KEY: ${{ secrets.NANOGPT_API_KEY }}
+          # NANOGPT_MODEL is inherited from the job-level env block.
+        run: python scripts/ai_resolve_conflicts.py
+
+      - name: Complete the merge commit
+        if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true' && steps.merge.outputs.conflicts == 'true'
+        run: |
+          # AI-resolved files are already staged. The remaining unmerged (U)
+          # paths are the ones the resolver could not finish and emitted into
+          # FAILED_FILES. We must stage them so the merge commit succeeds and
+          # the PR opens for a human to finish (a commit with unmerged index
+          # entries would fail outright). Two categories, logged for visibility:
+          #   - text files with inline <<<<<<< markers: the human resolves the
+          #     markers in the PR.
+          #   - structural conflicts (modify/delete, rename, binary, too large):
+          #     no markers to grep for. The original blanket `git add -A` staged
+          #     these silently; we still stage them (so the PR opens) but they
+          #     are surfaced non-silently via FAILED_FILES + the needs-manual-merge
+          #     label + the PR body, which points reviewers at the job summary.
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if [ -f "$f" ] && grep -Iq '^<<<<<<<' -- "$f"; then
+              echo "  surfacing (inline markers): $f"
+            else
+              echo "  surfacing (structural conflict, no markers): $f"
+            fi
+          done < <(git diff --name-only --diff-filter=U)
+
+          # Stage everything (unmerged paths + any non-conflict merge changes)
+          # so the commit can complete and the PR is opened for review.
+          git add -A
+
+          # Defensive backstop: `git add -A` stages worktree content at stage 0,
+          # which clears the unmerged (U) marker for every realistic conflict type
+          # (both-modified, modify/delete, rename, add/add, binary). The only
+          # entries it CANNOT clear are exotic ones with no stage-0 worktree blob:
+          # submodule/gitlink conflicts and directory-vs-file add/add collisions.
+          # This repo has none today (no .gitmodules, no .gitattributes merge
+          # drivers, Go-only tree), but a surviving U entry would make `git commit`
+          # fail and SKIP the push/PR steps below -> no PR, breaking the
+          # always-open-a-reviewable-PR invariant. If any survive, force-resolve
+          # them so the commit proceeds; they are still surfaced to the human via
+          # FAILED_FILES + the needs-manual-merge label + the PR body.
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            echo "::warning::force-resolving unmerged path that 'git add -A' could not clear: $f"
+            if [ -e "$f" ]; then
+              git add -- "$f"
+            else
+              git rm -rf -- "$f"
+            fi
+          done < <(git diff --name-only --diff-filter=U)
+
+          git commit -m "sync upstream/$UPSTREAM_BRANCH"
+
+      - name: Push sync branch
+        if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true'
+        run: git push origin "${{ steps.branch.outputs.branch }}"
+
+      - name: Generate pull request metadata
+        if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true'
+        id: pr_metadata
+        env:
+          NANOGPT_API_KEY: ${{ secrets.NANOGPT_API_KEY }}
+          BEHIND: ${{ steps.check.outputs.behind }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          RESOLVED: ${{ steps.ai.outputs.resolved }}
+          FAILED: ${{ steps.ai.outputs.failed }}
+          FAILED_FILES: ${{ steps.ai.outputs.failed_files }}
+        run: python scripts/ai_generate_pr_metadata.py
+
+      - name: Open pull request
+        if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          # This repo is a fork, and the job adds an `upstream` remote pointing at
+          # pelican-dev/wings. Without GH_REPO, `gh` resolves the "base repo" to the
+          # fork parent and runs `gh label`/`gh pr create` against pelican-dev/wings
+          # -> 403 (SYNC_PAT has no access there) / wrong target. Pin every gh call
+          # to this fork so the PR + labels land here.
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          FAILED: ${{ steps.ai.outputs.failed }}
+          TITLE: ${{ steps.pr_metadata.outputs.title }}
+          BODY: ${{ steps.pr_metadata.outputs.body }}
+        run: |
+          ensure_label() {
+            local name="$1"
+            local color="$2"
+            local description="$3"
+            local existing
+
+            existing="$(gh label list --search "$name" --json name --jq '.[].name')" || {
+              echo "::warning::could not query label '$name'; creating the PR without it"
+              return 1
+            }
+            if ! grep -Fxqi "$name" <<<"$existing"; then
+              gh label create "$name" --color "$color" --description "$description" || {
+                echo "::warning::could not create label '$name'; creating the PR without it"
+                return 1
+              }
+            fi
+          }
+
+          LABEL_ARGS=()
+          if ensure_label upstream-sync 0e8a16 "Automated upstream sync"; then
+            LABEL_ARGS+=(--label upstream-sync)
+          fi
+
+          if [ "$CONFLICTS" = "true" ] && [ "${FAILED:-0}" != "0" ]; then
+            if ensure_label needs-manual-merge d93f0b "AI could not fully resolve conflicts"; then
+              LABEL_ARGS+=(--label needs-manual-merge)
+            fi
+          fi
+
+          gh pr create \
+            --base "$TARGET_BRANCH" \
+            --head "$BRANCH" \
+            --title "$TITLE" \
+            --body "$BODY" \
+            "${LABEL_ARGS[@]}"
+
+      - name: Cleanup failed sync branch
+        if: failure() && steps.branch.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          # Same fork gotcha as the "Open pull request" step: pin gh to this fork
+          # so `gh pr list`/branch cleanup probe origin, not pelican-dev/wings.
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          set +e
+          case "$BRANCH" in
+            sync/upstream-*) ;;
+            *)
+              echo "Refusing to clean up non-sync branch: $BRANCH"
+              exit 0
+              ;;
+          esac
+
+          pr_count="$(gh pr list --state all --head "$BRANCH" --json number --jq 'length')" || {
+            echo "::warning::could not verify PR status for $BRANCH; refusing cleanup."
+            exit 0
+          }
+          case "$pr_count" in
+            ''|*[!0-9]*)
+              echo "::warning::unexpected PR count '$pr_count' for $BRANCH; refusing cleanup."
+              exit 0
+              ;;
+          esac
+          if [ "$pr_count" -gt 0 ]; then
+            echo "Pull request already exists for $BRANCH; leaving branch in place."
+            exit 0
+          fi
+
+          # Capture stderr (the git error) while discarding stdout; order matters:
+          # `2>&1 >/dev/null` != `>/dev/null 2>&1`. Do not swap — the swap empties ls_remote_err.
+          ls_remote_err="$(git ls-remote --exit-code --heads origin "$BRANCH" 2>&1 >/dev/null)"
+          ls_remote_code=$?
+          if [ "$ls_remote_code" -eq 0 ]; then
+            git push origin --delete "$BRANCH" || true
+          elif [ "$ls_remote_code" -eq 2 ]; then
+            echo "No remote branch to clean up: $BRANCH"
+          else
+            echo "::warning::git ls-remote failed (exit $ls_remote_code) while probing $BRANCH — branch may still exist; skipping delete. git output: $ls_remote_err"
+          fi
