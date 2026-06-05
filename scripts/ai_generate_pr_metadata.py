@@ -34,7 +34,10 @@ API_BASE = os.environ.get("NANOGPT_BASE_URL", "https://nano-gpt.com/api/v1").rst
 API_KEY = os.environ.get("NANOGPT_API_KEY", "").strip()
 MODEL = os.environ.get("NANOGPT_MODEL", "").strip()
 TIMEOUT = env_int("PR_METADATA_API_TIMEOUT", 45)
-RETRIES = env_int("PR_METADATA_API_RETRIES", 2)
+# Total attempt count (not retries-after-first); the warning logs read
+# "attempt {n}/{RETRIES}". Floor of 1 so RETRIES=0 can't silently disable
+# NanoGPT and fall straight through to the deterministic fallback.
+RETRIES = max(1, env_int("PR_METADATA_API_RETRIES", 2))
 MAX_OUTPUT_TOKENS = env_int("PR_METADATA_MAX_OUTPUT_TOKENS", 1200)
 
 UPSTREAM_BRANCH = os.environ.get("UPSTREAM_BRANCH", "main").strip() or "main"
@@ -57,12 +60,13 @@ EMOJI_RE = re.compile(
 )
 CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 ISSUE_CLOSER_RE = re.compile(
-    r"\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*((?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#)(\d+)",
+    r"\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*"
+    r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#(\d+)",
     flags=re.IGNORECASE,
 )
 ISSUE_CLOSER_URL_RE = re.compile(
     r"\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*"
-    r"https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/(\d+)",
+    r"https?://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/issues/(\d+)",
     flags=re.IGNORECASE,
 )
 
@@ -294,8 +298,16 @@ def strip_emoji_and_controls(value: str) -> str:
 
 
 def neutralize_issue_closers(value: str) -> str:
-    value = ISSUE_CLOSER_RE.sub(lambda match: f"{match.group(1)} issue {match.group(3)}", value)
-    return ISSUE_CLOSER_URL_RE.sub(lambda match: f"{match.group(1)} issue {match.group(2)}", value)
+    # Keep the repo identity (owner/repo) when present, but drop the literal
+    # "#"/issue-URL and interpose "issue" so no live auto-close reference
+    # ("<keyword> #N", "<keyword> owner/repo#N", "<keyword> <issue-url>")
+    # survives adjacent to the keyword. Double-safe by construction.
+    def repl(match: re.Match[str]) -> str:
+        repo = f"{match.group(2)} " if match.group(2) else ""
+        return f"{match.group(1)} {repo}issue {match.group(3)}"
+
+    value = ISSUE_CLOSER_RE.sub(repl, value)
+    return ISSUE_CLOSER_URL_RE.sub(repl, value)
 
 
 def sanitize_metadata(title: str, body: str) -> tuple[str, str]:
