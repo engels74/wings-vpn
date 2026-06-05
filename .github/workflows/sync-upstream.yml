@@ -192,6 +192,12 @@ jobs:
         if: steps.check.outputs.behind != '0'
         env:
           GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          # This repo is a fork, and the job adds an `upstream` remote pointing at
+          # pelican-dev/wings. Without GH_REPO, `gh` resolves the "base repo" to the
+          # fork parent and runs `gh label`/`gh pr create` against pelican-dev/wings
+          # -> 403 (SYNC_PAT has no access there) / wrong target. Pin every gh call
+          # to this fork so the PR + labels land here.
+          GH_REPO: ${{ github.repository }}
           BRANCH: ${{ steps.branch.outputs.branch }}
           CONFLICTS: ${{ steps.merge.outputs.conflicts }}
           FAILED: ${{ steps.ai.outputs.failed }}
@@ -238,6 +244,9 @@ jobs:
         if: failure() && steps.branch.outputs.branch != ''
         env:
           GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          # Same fork gotcha as the "Open pull request" step: pin gh to this fork
+          # so `gh pr list`/branch cleanup probe origin, not pelican-dev/wings.
+          GH_REPO: ${{ github.repository }}
           BRANCH: ${{ steps.branch.outputs.branch }}
         run: |
           set +e
