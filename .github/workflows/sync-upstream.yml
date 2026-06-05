@@ -95,7 +95,7 @@ jobs:
         id: merge
         run: |
           set +e
-          git merge --no-edit "upstream/$UPSTREAM_BRANCH"
+          git merge --no-edit -m "sync upstream/$UPSTREAM_BRANCH" "upstream/$UPSTREAM_BRANCH"
           code=$?
           set -e
           # git merge exits 0 on a clean merge and 1 when there are conflicts.
@@ -170,51 +170,61 @@ jobs:
             fi
           done < <(git diff --name-only --diff-filter=U)
 
-          git commit --no-edit
+          git commit -m "sync upstream/$UPSTREAM_BRANCH"
 
       - name: Push sync branch
         if: steps.check.outputs.behind != '0'
         run: git push origin "${{ steps.branch.outputs.branch }}"
+
+      - name: Generate pull request metadata
+        if: steps.check.outputs.behind != '0'
+        id: pr_metadata
+        env:
+          NANOGPT_API_KEY: ${{ secrets.NANOGPT_API_KEY }}
+          BEHIND: ${{ steps.check.outputs.behind }}
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+          RESOLVED: ${{ steps.ai.outputs.resolved }}
+          FAILED: ${{ steps.ai.outputs.failed }}
+          FAILED_FILES: ${{ steps.ai.outputs.failed_files }}
+        run: python scripts/ai_generate_pr_metadata.py
 
       - name: Open pull request
         if: steps.check.outputs.behind != '0'
         env:
           GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
           BRANCH: ${{ steps.branch.outputs.branch }}
-          BEHIND: ${{ steps.check.outputs.behind }}
           CONFLICTS: ${{ steps.merge.outputs.conflicts }}
-          RESOLVED: ${{ steps.ai.outputs.resolved }}
           FAILED: ${{ steps.ai.outputs.failed }}
-          FAILED_FILES: ${{ steps.ai.outputs.failed_files }}
+          TITLE: ${{ steps.pr_metadata.outputs.title }}
+          BODY: ${{ steps.pr_metadata.outputs.body }}
         run: |
-          # Make sure labels exist (no-op if they already do).
-          gh label create upstream-sync --color 0e8a16 --description "Automated upstream sync" 2>/dev/null || true
-          gh label create needs-manual-merge --color d93f0b --description "AI could not fully resolve conflicts" 2>/dev/null || true
+          ensure_label() {
+            local name="$1"
+            local color="$2"
+            local description="$3"
+            local existing
 
-          LABELS="upstream-sync"
-          if [ "$CONFLICTS" = "true" ]; then
-            TITLE="Sync upstream/$UPSTREAM_BRANCH (AI-assisted, $BEHIND commits)"
-            BODY="Merged \`upstream/$UPSTREAM_BRANCH\` ($BEHIND commits behind).
-
-          **Conflicts were present.** NanoGPT ($NANOGPT_MODEL) resolved **$RESOLVED** file(s); **$FAILED** still need a human."
-            if [ "${FAILED:-0}" != "0" ]; then
-              LABELS="$LABELS,needs-manual-merge"
-              BODY="$BODY
-
-          ⚠️ Files still needing manual attention:
-          \`$FAILED_FILES\`
-
-          Not all of these contain inline \`<<<<<<<\` markers — some are structural
-          conflicts (modify/delete, rename, binary, or too-large files) with no
-          markers to search for. See the workflow run's job summary for the
-          per-file reason, and inspect each file individually."
+            existing="$(gh label list --search "$name" --json name --jq '.[].name')" || {
+              echo "::warning::could not query label '$name'; creating the PR without it"
+              return 1
+            }
+            if ! grep -Fxqi "$name" <<<"$existing"; then
+              gh label create "$name" --color "$color" --description "$description" || {
+                echo "::warning::could not create label '$name'; creating the PR without it"
+                return 1
+              }
             fi
-            BODY="$BODY
+          }
 
-          Review the diff carefully before merging."
-          else
-            TITLE="Sync upstream/$UPSTREAM_BRANCH ($BEHIND commits, clean)"
-            BODY="Merged \`upstream/$UPSTREAM_BRANCH\` cleanly ($BEHIND commits). No conflicts."
+          LABEL_ARGS=()
+          if ensure_label upstream-sync 0e8a16 "Automated upstream sync"; then
+            LABEL_ARGS+=(--label upstream-sync)
+          fi
+
+          if [ "$CONFLICTS" = "true" ] && [ "${FAILED:-0}" != "0" ]; then
+            if ensure_label needs-manual-merge d93f0b "AI could not fully resolve conflicts"; then
+              LABEL_ARGS+=(--label needs-manual-merge)
+            fi
           fi
 
           gh pr create \
@@ -222,4 +232,46 @@ jobs:
             --head "$BRANCH" \
             --title "$TITLE" \
             --body "$BODY" \
-            --label "$LABELS"
+            "${LABEL_ARGS[@]}"
+
+      - name: Cleanup failed sync branch
+        if: failure() && steps.branch.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.branch.outputs.branch }}
+        run: |
+          set +e
+          case "$BRANCH" in
+            sync/upstream-*) ;;
+            *)
+              echo "Refusing to clean up non-sync branch: $BRANCH"
+              exit 0
+              ;;
+          esac
+
+          pr_count="$(gh pr list --state all --head "$BRANCH" --json number --jq 'length')" || {
+            echo "::warning::could not verify PR status for $BRANCH; refusing cleanup."
+            exit 0
+          }
+          case "$pr_count" in
+            ''|*[!0-9]*)
+              echo "::warning::unexpected PR count '$pr_count' for $BRANCH; refusing cleanup."
+              exit 0
+              ;;
+          esac
+          if [ "$pr_count" -gt 0 ]; then
+            echo "Pull request already exists for $BRANCH; leaving branch in place."
+            exit 0
+          fi
+
+          # Capture stderr (the git error) while discarding stdout; order matters:
+          # `2>&1 >/dev/null` != `>/dev/null 2>&1`. Do not swap — the swap empties ls_remote_err.
+          ls_remote_err="$(git ls-remote --exit-code --heads origin "$BRANCH" 2>&1 >/dev/null)"
+          ls_remote_code=$?
+          if [ "$ls_remote_code" -eq 0 ]; then
+            git push origin --delete "$BRANCH" || true
+          elif [ "$ls_remote_code" -eq 2 ]; then
+            echo "No remote branch to clean up: $BRANCH"
+          else
+            echo "::warning::git ls-remote failed (exit $ls_remote_code) while probing $BRANCH — branch may still exist; skipping delete. git output: $ls_remote_err"
+          fi
