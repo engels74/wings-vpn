@@ -80,7 +80,19 @@ jobs:
         id: check
         run: |
           git checkout "$TARGET_BRANCH"
-          BEHIND=$(git rev-list --count "HEAD..upstream/$UPSTREAM_BRANCH" || echo 0)
+          # `|| echo 0` would mask a rev-list failure (e.g. a broken/missing
+          # upstream/$UPSTREAM_BRANCH ref or a partial fetch) as "0 behind",
+          # which then propagates into the behind output, the logs, and the PR
+          # metadata as a misleading "up to date". Capture the real exit code and
+          # fail loudly so a broken ref/repo state is surfaced, not swallowed.
+          set +e
+          BEHIND=$(git rev-list --count "HEAD..upstream/$UPSTREAM_BRANCH")
+          rl_code=$?
+          set -e
+          if [ "$rl_code" -ne 0 ]; then
+            echo "::error::git rev-list failed (exit $rl_code) computing commits behind upstream/$UPSTREAM_BRANCH. The ref may be broken/missing or the fetch was incomplete." >&2
+            exit "$rl_code"
+          fi
           HEAD_TREE=$(git rev-parse "HEAD^{tree}")
 
           # Tier 1 -- fast ancestor check. If upstream is already an ancestor of
