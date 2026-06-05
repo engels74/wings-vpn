@@ -55,10 +55,12 @@ EMOJI_RE = re.compile(
     "\U0001F000-\U0001FAFF"
     "\U00002700-\U000027BF"
     "\U00002600-\U000026FF"
+    "\U0000FE00-\U0000FE0F"  # variation selectors VS1-VS16 (e.g. U+FE0F glue)
+    "\U0000200D"  # zero-width joiner that binds composed (ZWJ) emoji
     "]+",
     flags=re.UNICODE,
 )
-CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0d\x0e-\x1f\x7f]")
 ISSUE_CLOSER_RE = re.compile(
     r"\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*"
     r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#(\d+)",
