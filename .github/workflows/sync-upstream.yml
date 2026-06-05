@@ -120,12 +120,22 @@ jobs:
             # prior squash merge. Nothing to sync.
             echo "sync_needed=false" >> "$GITHUB_OUTPUT"
             echo "conflicts=false"   >> "$GITHUB_OUTPUT"
+            echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+            # $BEHIND is commit-graph-based; the content-equivalence gate just
+            # decided upstream's changes are already present (prior squash merge),
+            # so do NOT claim we are "behind" -- that would be misleading.
+            echo "Upstream content already present (squash-merged); $BEHIND commit(s) apart in the graph but nothing to sync."
+            exit 0
           elif [ "$mt_code" -eq 0 ]; then
             echo "sync_needed=true"  >> "$GITHUB_OUTPUT"
             echo "conflicts=false"   >> "$GITHUB_OUTPUT"   # clean, with real changes
           elif [ "$mt_code" -eq 1 ]; then
             echo "sync_needed=true"  >> "$GITHUB_OUTPUT"
             echo "conflicts=true"    >> "$GITHUB_OUTPUT"    # genuine merge conflicts
+            # merge-tree wrote its conflict report (conflicted-file stage list +
+            # "CONFLICT ..." lines) to stdout, captured in MT_OUT. Echo it so the
+            # log shows WHICH paths conflicted instead of just "conflicts=true".
+            printf '%s\n' "$MT_OUT"
           else
             # Exit >1 is a real merge-tree failure, NOT a conflict. Misclassifying
             # it as conflicts=true would route to the AI/PR path and hide the root
@@ -155,7 +165,26 @@ jobs:
             echo "No content change after merge; nothing to push."
             exit 0
           fi
+
+          # The push can be rejected non-fast-forward if a human advanced
+          # origin/$TARGET_BRANCH after this job's checkout (line ~153). A blind
+          # --force would clobber that human commit, so instead: on rejection,
+          # fetch the advanced target and merge it INTO our sync result, then
+          # retry once. This preserves the human's work. If the retry also
+          # fails, hard-fail loudly rather than loop or force.
+          set +e
           git push origin "HEAD:$TARGET_BRANCH"
+          push_code=$?
+          set -e
+          if [ "$push_code" -ne 0 ]; then
+            echo "::warning::push to $TARGET_BRANCH was rejected (likely non-fast-forward: the branch advanced during this run). Fetching and re-merging the advanced target, then retrying once."
+            git fetch origin "$TARGET_BRANCH"
+            # Merge the advanced remote tip into our sync result. If a human's
+            # change conflicts with the upstream sync, fail loudly: this path is
+            # for clean syncs only, and a conflict here needs human attention.
+            git merge --no-edit -m "merge concurrent $TARGET_BRANCH advance into upstream sync" "origin/$TARGET_BRANCH"
+            git push origin "HEAD:$TARGET_BRANCH"
+          fi
 
       - name: Create sync branch
         if: steps.check.outputs.conflicts == 'true'
