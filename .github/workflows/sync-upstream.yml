@@ -106,8 +106,11 @@ jobs:
           # HEAD's tree. Equal => content already present => no-op. Capture WITHOUT
           # a pipe so $? is merge-tree's, not head's.
           # (`git merge-tree --write-tree` needs git >= 2.38; ubuntu-latest ships >= 2.43.)
+          # Exit codes: 0 = clean merge, 1 = merge conflicts, >1 = a real error
+          # (bad usage, not a repo, missing object, ...). Keep stderr so a real
+          # error is diagnosable instead of silently swallowed.
           set +e
-          MT_OUT=$(git merge-tree --write-tree HEAD "upstream/$UPSTREAM_BRANCH" 2>/dev/null)
+          MT_OUT=$(git merge-tree --write-tree HEAD "upstream/$UPSTREAM_BRANCH")
           mt_code=$?
           set -e
           MERGED_TREE=$(printf '%s\n' "$MT_OUT" | head -n1)   # clean output is a single line: the tree OID
@@ -120,9 +123,15 @@ jobs:
           elif [ "$mt_code" -eq 0 ]; then
             echo "sync_needed=true"  >> "$GITHUB_OUTPUT"
             echo "conflicts=false"   >> "$GITHUB_OUTPUT"   # clean, with real changes
-          else
+          elif [ "$mt_code" -eq 1 ]; then
             echo "sync_needed=true"  >> "$GITHUB_OUTPUT"
-            echo "conflicts=true"    >> "$GITHUB_OUTPUT"    # conflicts (or unrelated histories)
+            echo "conflicts=true"    >> "$GITHUB_OUTPUT"    # genuine merge conflicts
+          else
+            # Exit >1 is a real merge-tree failure, NOT a conflict. Misclassifying
+            # it as conflicts=true would route to the AI/PR path and hide the root
+            # cause; fail the step instead so it is not misattributed.
+            echo "git merge-tree failed with exit code $mt_code (not a conflict)." >&2
+            exit "$mt_code"
           fi
           echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
           echo "Fork is $BEHIND commit(s) behind upstream/$UPSTREAM_BRANCH"
@@ -252,9 +261,18 @@ jobs:
           # and can fail to attach, making a label-keyed query miss a prior PR and
           # re-open a duplicate. headRefName is set at branch creation and is
           # always present.
+          # Distinguish "no open PRs" from "the query itself failed". A blanket
+          # `|| open_count=0` would silently treat an auth/rate-limit/CLI failure
+          # as "no PR open" and re-enable duplicate PR creation with no warning.
+          set +e
           open_count="$(gh pr list --state open --base "$TARGET_BRANCH" --json headRefName \
-            --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))] | length')" || open_count=0
-          if [ "${open_count:-0}" -gt 0 ]; then
+            --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))] | length')"
+          gh_code=$?
+          set -e
+          if [ "$gh_code" -ne 0 ]; then
+            echo "::warning::\`gh pr list\` failed (exit $gh_code); cannot verify whether a sync PR is already open. Skipping to avoid opening a possible duplicate -- re-run once the gh/API issue clears."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "${open_count:-0}" -gt 0 ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             # Surface loudly: skip-if-open means an ABANDONED open PR would otherwise
             # pause syncs silently and indefinitely. Annotate so it shows in the
