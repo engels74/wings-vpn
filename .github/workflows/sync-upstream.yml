@@ -213,8 +213,50 @@ jobs:
           git checkout -b "$BRANCH"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
-      - name: Merge upstream
+      - name: Dedupe open sync PRs
         if: steps.check.outputs.conflicts == 'true'
+        id: dedupe
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          # Same fork gotcha as "Open pull request": pin gh to this fork so
+          # `gh pr list` probes origin, not pelican-dev/wings.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Run BEFORE the expensive merge/AI/commit steps so a run that will be
+          # skipped (a sync PR is already open) short-circuits cheaply -- it never
+          # burns NanoGPT quota and cannot fail mid-merge. This check depends only
+          # on $TARGET_BRANCH + the fork's PR list, none of which is produced by the
+          # merge/AI/commit steps, so hoisting it does not change its result.
+          #
+          # Match the unconditional `sync/upstream-*` branch naming, NOT the
+          # `upstream-sync` label: the label is attached inside `Open pull request`
+          # and can fail to attach, making a label-keyed query miss a prior PR and
+          # re-open a duplicate. headRefName is set at branch creation and is
+          # always present.
+          # Distinguish "no open PRs" from "the query itself failed". A blanket
+          # `|| open_count=0` would silently treat an auth/rate-limit/CLI failure
+          # as "no PR open" and re-enable duplicate PR creation with no warning.
+          set +e
+          open_count="$(gh pr list --state open --base "$TARGET_BRANCH" --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))] | length')"
+          gh_code=$?
+          set -e
+          if [ "$gh_code" -ne 0 ]; then
+            echo "::warning::\`gh pr list\` failed (exit $gh_code); cannot verify whether a sync PR is already open. Skipping to avoid opening a possible duplicate -- re-run once the gh/API issue clears."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "${open_count:-0}" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            # Surface loudly: skip-if-open means an ABANDONED open PR would otherwise
+            # pause syncs silently and indefinitely. Annotate so it shows in the
+            # Actions UI, not just the step summary.
+            echo "::warning::An upstream-sync PR is already open against $TARGET_BRANCH; skipping a duplicate. If that PR is stale/abandoned, syncs stay PAUSED until it is merged or closed."
+            echo "An upstream-sync PR is already open; not opening a duplicate." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge upstream
+        if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true'
         id: merge
         run: |
           set +e
@@ -237,7 +279,7 @@ jobs:
           fi
 
       - name: AI conflict resolution
-        if: steps.check.outputs.conflicts == 'true' && steps.merge.outputs.conflicts == 'true'
+        if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true' && steps.merge.outputs.conflicts == 'true'
         id: ai
         env:
           NANOGPT_API_KEY: ${{ secrets.NANOGPT_API_KEY }}
@@ -245,7 +287,7 @@ jobs:
         run: python scripts/ai_resolve_conflicts.py
 
       - name: Complete the merge commit
-        if: steps.check.outputs.conflicts == 'true' && steps.merge.outputs.conflicts == 'true'
+        if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true' && steps.merge.outputs.conflicts == 'true'
         run: |
           # AI-resolved files are already staged. The remaining unmerged (U)
           # paths are the ones the resolver could not finish and emitted into
@@ -294,42 +336,6 @@ jobs:
           done < <(git diff --name-only --diff-filter=U)
 
           git commit -m "sync upstream/$UPSTREAM_BRANCH"
-
-      - name: Dedupe open sync PRs
-        if: steps.check.outputs.conflicts == 'true'
-        id: dedupe
-        env:
-          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
-          # Same fork gotcha as "Open pull request": pin gh to this fork so
-          # `gh pr list` probes origin, not pelican-dev/wings.
-          GH_REPO: ${{ github.repository }}
-        run: |
-          # Match the unconditional `sync/upstream-*` branch naming, NOT the
-          # `upstream-sync` label: the label is attached inside `Open pull request`
-          # and can fail to attach, making a label-keyed query miss a prior PR and
-          # re-open a duplicate. headRefName is set at branch creation and is
-          # always present.
-          # Distinguish "no open PRs" from "the query itself failed". A blanket
-          # `|| open_count=0` would silently treat an auth/rate-limit/CLI failure
-          # as "no PR open" and re-enable duplicate PR creation with no warning.
-          set +e
-          open_count="$(gh pr list --state open --base "$TARGET_BRANCH" --json headRefName \
-            --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))] | length')"
-          gh_code=$?
-          set -e
-          if [ "$gh_code" -ne 0 ]; then
-            echo "::warning::\`gh pr list\` failed (exit $gh_code); cannot verify whether a sync PR is already open. Skipping to avoid opening a possible duplicate -- re-run once the gh/API issue clears."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          elif [ "${open_count:-0}" -gt 0 ]; then
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            # Surface loudly: skip-if-open means an ABANDONED open PR would otherwise
-            # pause syncs silently and indefinitely. Annotate so it shows in the
-            # Actions UI, not just the step summary.
-            echo "::warning::An upstream-sync PR is already open against $TARGET_BRANCH; skipping a duplicate. If that PR is stale/abandoned, syncs stay PAUSED until it is merged or closed."
-            echo "An upstream-sync PR is already open; not opening a duplicate." >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Push sync branch
         if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true'
