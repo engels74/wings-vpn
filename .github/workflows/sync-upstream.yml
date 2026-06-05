@@ -208,7 +208,7 @@ jobs:
               echo "::warning::could not query label '$name'; creating the PR without it"
               return 1
             }
-            if ! grep -Fxq "$name" <<<"$existing"; then
+            if ! grep -Fxqi "$name" <<<"$existing"; then
               gh label create "$name" --color "$color" --description "$description" || {
                 echo "::warning::could not create label '$name'; creating the PR without it"
                 return 1

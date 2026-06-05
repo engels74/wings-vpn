@@ -313,9 +313,13 @@ def neutralize_issue_closers(value: str) -> str:
 
 
 def sanitize_metadata(title: str, body: str) -> tuple[str, str]:
-    fallback_title, fallback_body = fallback_metadata()
-    title = " ".join(strip_emoji_and_controls(title).split()) or fallback_title
-    body = neutralize_issue_closers(strip_emoji_and_controls(body)) or fallback_body
+    title = " ".join(strip_emoji_and_controls(title).split())
+    body = neutralize_issue_closers(strip_emoji_and_controls(body))
+    # Only pay for fallback (a git subprocess) when the model left a field empty.
+    if not title or not body:
+        fallback_title, fallback_body = fallback_metadata()
+        title = title or fallback_title
+        body = body or fallback_body
 
     # These caps (100/1800) are deliberate safety ceilings, intentionally wider
     # than the model's 80/900 prompt targets (see SYSTEM_PROMPT): the prompt
