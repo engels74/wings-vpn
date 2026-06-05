@@ -231,15 +231,48 @@ def call_model() -> tuple[str, str] | None:
     return None
 
 
+def extract_json_object(text: str) -> str:
+    # Prefer a strict parse of the whole string; only fall back to extraction
+    # when the model wraps the object in explanatory prose. Scanning for a
+    # brace-balanced slice (tracking string/escape state) avoids being fooled
+    # by stray prose braces after the object or braces inside string values.
+    try:
+        json.loads(text)
+        return text
+    except json.JSONDecodeError:
+        pass
+    start = text.find("{")
+    if start == -1:
+        raise ValueError("model did not return a JSON object")
+    depth = 0
+    in_string = False
+    escaped = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    raise ValueError("model did not return a JSON object")
+
+
 def parse_model_json(content: str) -> dict[str, str]:
     text = content.strip()
     if text.startswith("```"):
         raise ValueError("model returned a markdown code fence")
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise ValueError("model did not return a JSON object")
-    data = json.loads(text[start:end + 1])
+    data = json.loads(extract_json_object(text))
     if not isinstance(data, dict):
         raise ValueError("model JSON was not an object")
     title = data.get("title")
@@ -279,6 +312,10 @@ def sanitize_metadata(title: str, body: str) -> tuple[str, str]:
         )
 
     body = neutralize_issue_closers(strip_emoji_and_controls(body))
+    # Re-apply the cap: the conflict backstops above can append after the
+    # earlier truncation and push the body past the intended maximum.
+    if len(body) > 1800:
+        body = body[:1797].rstrip() + "..."
     return title, body
 
 

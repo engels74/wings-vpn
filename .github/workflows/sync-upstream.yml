@@ -264,8 +264,12 @@ jobs:
             exit 0
           fi
 
-          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+          ls_remote_err="$(git ls-remote --exit-code --heads origin "$BRANCH" 2>&1 >/dev/null)"
+          ls_remote_code=$?
+          if [ "$ls_remote_code" -eq 0 ]; then
             git push origin --delete "$BRANCH" || true
-          else
+          elif [ "$ls_remote_code" -eq 2 ]; then
             echo "No remote branch to clean up: $BRANCH"
+          else
+            echo "::warning::git ls-remote failed (exit $ls_remote_code) while probing $BRANCH — branch may still exist; skipping delete. git output: $ls_remote_err"
           fi
