@@ -60,6 +60,11 @@ ISSUE_CLOSER_RE = re.compile(
     r"\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*((?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#)(\d+)",
     flags=re.IGNORECASE,
 )
+ISSUE_CLOSER_URL_RE = re.compile(
+    r"\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*"
+    r"https?://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/issues/(\d+)",
+    flags=re.IGNORECASE,
+)
 
 
 SYSTEM_PROMPT = """You write concise, professional GitHub pull request metadata.
@@ -289,7 +294,8 @@ def strip_emoji_and_controls(value: str) -> str:
 
 
 def neutralize_issue_closers(value: str) -> str:
-    return ISSUE_CLOSER_RE.sub(lambda match: f"{match.group(1)} issue {match.group(3)}", value)
+    value = ISSUE_CLOSER_RE.sub(lambda match: f"{match.group(1)} issue {match.group(3)}", value)
+    return ISSUE_CLOSER_URL_RE.sub(lambda match: f"{match.group(1)} issue {match.group(2)}", value)
 
 
 def sanitize_metadata(title: str, body: str) -> tuple[str, str]:
