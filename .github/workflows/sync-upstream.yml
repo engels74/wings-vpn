@@ -264,6 +264,8 @@ jobs:
             exit 0
           fi
 
+          # Capture stderr (the git error) while discarding stdout; order matters:
+          # `2>&1 >/dev/null` != `>/dev/null 2>&1`. Do not swap — the swap empties ls_remote_err.
           ls_remote_err="$(git ls-remote --exit-code --heads origin "$BRANCH" 2>&1 >/dev/null)"
           ls_remote_code=$?
           if [ "$ls_remote_code" -eq 0 ]; then
