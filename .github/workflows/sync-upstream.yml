@@ -1,9 +1,11 @@
 name: Sync upstream (AI-assisted)
 
 # Keeps engels74/wings-vpn in sync with pelican-dev/wings.
-# - Clean merges  -> opens a PR for review.
-# - Conflicts     -> NanoGPT resolves what it can, the rest is flagged in the PR.
-# Nothing is ever pushed straight to your default branch; you click merge.
+# - Clean merges  -> auto-merged straight to your default branch, validated
+#                    post-merge by push.yaml CI (no PR, no AI).
+# - Conflicts     -> NanoGPT resolves what it can, the rest is flagged in a
+#                    single AI-assisted PR (deduped while one is already open).
+# Nothing is pushed to your default branch when conflicts exist; you click merge.
 
 on:
   schedule:
@@ -78,12 +80,76 @@ jobs:
         id: check
         run: |
           git checkout "$TARGET_BRANCH"
-          BEHIND=$(git rev-list --count "HEAD..upstream/$UPSTREAM_BRANCH")
+          BEHIND=$(git rev-list --count "HEAD..upstream/$UPSTREAM_BRANCH" || echo 0)
+          HEAD_TREE=$(git rev-parse "HEAD^{tree}")
+
+          # Tier 1 -- fast ancestor check. If upstream is already an ancestor of
+          # HEAD, every upstream commit is reachable from main => nothing to sync.
+          # This catches all *clean-path* drift cheaply: clean auto-merges push a
+          # real merge commit, making upstream an ancestor on the next run. errexit
+          # does NOT apply to the command in an `if` condition, so a non-ancestor
+          # (exit 1) is handled here, not treated as a step failure.
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
+            {
+              echo "sync_needed=false"
+              echo "conflicts=false"
+              echo "behind=$BEHIND"
+            } >> "$GITHUB_OUTPUT"
+            echo "Up to date (upstream is an ancestor of $TARGET_BRANCH)."
+            exit 0
+          fi
+
+          # Tier 2 -- squash-proof content check. Tier 1 does NOT catch a
+          # squash-merged conflict PR (squash drops the parent edge, so upstream
+          # is not an ancestor even though its content is present). Run a real
+          # 3-way merge against the merge-base and compare the resulting tree to
+          # HEAD's tree. Equal => content already present => no-op. Capture WITHOUT
+          # a pipe so $? is merge-tree's, not head's.
+          # (`git merge-tree --write-tree` needs git >= 2.38; ubuntu-latest ships >= 2.43.)
+          set +e
+          MT_OUT=$(git merge-tree --write-tree HEAD "upstream/$UPSTREAM_BRANCH" 2>/dev/null)
+          mt_code=$?
+          set -e
+          MERGED_TREE=$(printf '%s\n' "$MT_OUT" | head -n1)   # clean output is a single line: the tree OID
+
+          if [ "$mt_code" -eq 0 ] && [ "$MERGED_TREE" = "$HEAD_TREE" ]; then
+            # Clean merge that changes nothing => content already present via a
+            # prior squash merge. Nothing to sync.
+            echo "sync_needed=false" >> "$GITHUB_OUTPUT"
+            echo "conflicts=false"   >> "$GITHUB_OUTPUT"
+          elif [ "$mt_code" -eq 0 ]; then
+            echo "sync_needed=true"  >> "$GITHUB_OUTPUT"
+            echo "conflicts=false"   >> "$GITHUB_OUTPUT"   # clean, with real changes
+          else
+            echo "sync_needed=true"  >> "$GITHUB_OUTPUT"
+            echo "conflicts=true"    >> "$GITHUB_OUTPUT"    # conflicts (or unrelated histories)
+          fi
           echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
           echo "Fork is $BEHIND commit(s) behind upstream/$UPSTREAM_BRANCH"
 
+      - name: Clean merge to default branch
+        if: steps.check.outputs.sync_needed == 'true' && steps.check.outputs.conflicts == 'false'
+        id: clean_merge
+        run: |
+          git checkout "$TARGET_BRANCH"
+          BASE=$(git rev-parse HEAD)
+          git merge --no-edit -m "sync upstream/$UPSTREAM_BRANCH (clean auto-merge)" "upstream/$UPSTREAM_BRANCH"
+          # Belt-and-suspenders backstop (expected never to fire). The Tier-2 gate
+          # already excludes the empty-merge case: we only reach here when
+          # MERGED_TREE != HEAD_TREE, so a clean real merge necessarily changes
+          # content. This guard can only trip if merge-tree and the real merge
+          # disagree on the result tree (worktree hooks / gitattributes merge
+          # drivers that merge-tree bypasses) -- this repo has none (Go-only, no
+          # .gitattributes drivers). Keep it as a defense, but do NOT treat it as
+          # the primary divergence guard.
+          if git diff --quiet "$BASE" HEAD; then
+            echo "No content change after merge; nothing to push."
+            exit 0
+          fi
+          git push origin "HEAD:$TARGET_BRANCH"
+
       - name: Create sync branch
-        if: steps.check.outputs.behind != '0'
+        if: steps.check.outputs.conflicts == 'true'
         id: branch
         run: |
           BRANCH="sync/upstream-$(date +%Y%m%d-%H%M%S)-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -91,7 +157,7 @@ jobs:
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Merge upstream
-        if: steps.check.outputs.behind != '0'
+        if: steps.check.outputs.conflicts == 'true'
         id: merge
         run: |
           set +e
@@ -114,7 +180,7 @@ jobs:
           fi
 
       - name: AI conflict resolution
-        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflicts == 'true'
+        if: steps.check.outputs.conflicts == 'true' && steps.merge.outputs.conflicts == 'true'
         id: ai
         env:
           NANOGPT_API_KEY: ${{ secrets.NANOGPT_API_KEY }}
@@ -122,7 +188,7 @@ jobs:
         run: python scripts/ai_resolve_conflicts.py
 
       - name: Complete the merge commit
-        if: steps.check.outputs.behind != '0' && steps.merge.outputs.conflicts == 'true'
+        if: steps.check.outputs.conflicts == 'true' && steps.merge.outputs.conflicts == 'true'
         run: |
           # AI-resolved files are already staged. The remaining unmerged (U)
           # paths are the ones the resolver could not finish and emitted into
@@ -172,12 +238,39 @@ jobs:
 
           git commit -m "sync upstream/$UPSTREAM_BRANCH"
 
+      - name: Dedupe open sync PRs
+        if: steps.check.outputs.conflicts == 'true'
+        id: dedupe
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
+          # Same fork gotcha as "Open pull request": pin gh to this fork so
+          # `gh pr list` probes origin, not pelican-dev/wings.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Match the unconditional `sync/upstream-*` branch naming, NOT the
+          # `upstream-sync` label: the label is attached inside `Open pull request`
+          # and can fail to attach, making a label-keyed query miss a prior PR and
+          # re-open a duplicate. headRefName is set at branch creation and is
+          # always present.
+          open_count="$(gh pr list --state open --base "$TARGET_BRANCH" --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("sync/upstream-"))] | length')" || open_count=0
+          if [ "${open_count:-0}" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            # Surface loudly: skip-if-open means an ABANDONED open PR would otherwise
+            # pause syncs silently and indefinitely. Annotate so it shows in the
+            # Actions UI, not just the step summary.
+            echo "::warning::An upstream-sync PR is already open against $TARGET_BRANCH; skipping a duplicate. If that PR is stale/abandoned, syncs stay PAUSED until it is merged or closed."
+            echo "An upstream-sync PR is already open; not opening a duplicate." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Push sync branch
-        if: steps.check.outputs.behind != '0'
+        if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true'
         run: git push origin "${{ steps.branch.outputs.branch }}"
 
       - name: Generate pull request metadata
-        if: steps.check.outputs.behind != '0'
+        if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true'
         id: pr_metadata
         env:
           NANOGPT_API_KEY: ${{ secrets.NANOGPT_API_KEY }}
@@ -189,7 +282,7 @@ jobs:
         run: python scripts/ai_generate_pr_metadata.py
 
       - name: Open pull request
-        if: steps.check.outputs.behind != '0'
+        if: steps.check.outputs.conflicts == 'true' && steps.dedupe.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
           # This repo is a fork, and the job adds an `upstream` remote pointing at
