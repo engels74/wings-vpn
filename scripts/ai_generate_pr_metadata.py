@@ -65,6 +65,15 @@ UPSTREAM_REF = f"upstream/{UPSTREAM_BRANCH}"
 MAX_BODY_CHARS = 60000
 MAX_TITLE_CHARS = 100
 
+# Per-field display limits. Every unbounded string that reaches the body is
+# clipped here so the rendered size is a function of the budget ladder below
+# rather than of how much text upstream or the model happened to produce.
+MAX_SUMMARY_CHARS = 500
+MAX_RESOLUTION_CHARS = 160
+MAX_SIDE_CHARS = 300
+MAX_SUBJECT_CHARS = 120
+MAX_PATH_CHARS = 200
+
 # How much per-conflict diff context the model gets. Enough to describe the
 # disagreement, small enough that a dozen conflicts still fit one request.
 CONFLICT_DIFF_MAX_CHARS = 2000
@@ -321,6 +330,37 @@ def cell(value: str) -> str:
     return value.replace("|", "\\|")
 
 
+def clip(value: str, limit: int) -> str:
+    return value if len(value) <= limit else value[: limit - 3].rstrip() + "..."
+
+
+@dataclass(frozen=True)
+class Budget:
+    """How much of each unbounded list the body may spend.
+
+    A pathological sync (hundreds of commits, hundreds of conflicts) must not be
+    fixed by slicing the finished Markdown: that leaves `<details>` blocks and
+    fences unclosed and drops the checklist. Instead the renderer is re-run with
+    a tighter budget until the result fits, so every section stays balanced and
+    the omission is stated rather than implied.
+    """
+
+    max_commits: int = 0  # 0 means unlimited
+    max_conflicts: int = 0
+    detail: bool = True
+    stat: bool = True
+
+
+# Tried in order; the last entry is bounded by the per-field limits above and so
+# always fits, which is what makes the raw slice in `finalize` unreachable.
+BUDGETS = (
+    Budget(),
+    Budget(max_commits=150, max_conflicts=50),
+    Budget(max_commits=50, max_conflicts=25),
+    Budget(max_commits=25, max_conflicts=25, detail=False, stat=False),
+)
+
+
 @dataclass(frozen=True)
 class Facts:
     """Everything the template needs, gathered once. Defaults render as an
@@ -354,7 +394,7 @@ def collect_facts() -> Facts:
         return Facts()
 
 
-def render_body(prose: dict[str, object] | None, facts: Facts) -> str:
+def render_body(prose: dict[str, object] | None, facts: Facts, budget: Budget = Budget()) -> str:
     prose = prose or {}
     summary = str(prose.get("summary", "")).strip()
     per_file = prose.get("conflicts")
@@ -410,17 +450,23 @@ def render_body(prose: dict[str, object] | None, facts: Facts) -> str:
         )
         out.append("")
     else:
+        shown = entries[: budget.max_conflicts] if budget.max_conflicts else entries
         out.append("| File | Type | Resolution |")
         out.append("| --- | --- | --- |")
-        for entry in entries:
+        for entry in shown:
             if entry["status"] == "manual":
                 resolution = "unresolved"
             else:
                 detail = per_file.get(entry["path"])
                 resolution = cell(str(detail.get("resolution", ""))) if isinstance(detail, dict) else ""
                 resolution = resolution or NA
-            out.append(f"| `{cell(entry['path'])}` | {cell(entry['type'])} | {resolution} |")
+            path = clip(cell(entry["path"]), MAX_PATH_CHARS)
+            out.append(f"| `{path}` | {cell(entry['type'])} | {resolution} |")
         out.append("")
+        if len(shown) < len(entries):
+            omitted = len(entries) - len(shown)
+            out.append(f"... and {omitted} more conflicted {plural(omitted, 'file')}; see the {job_summary_link()}.")
+            out.append("")
         if needs_manual:
             verb = "needs" if manual_count == 1 else "need"
             out.append(
@@ -432,14 +478,20 @@ def render_body(prose: dict[str, object] | None, facts: Facts) -> str:
         out.append("<details>")
         out.append("<summary>Per-file detail</summary>")
         out.append("")
-        for entry in entries:
+        if not budget.detail:
+            out.append(
+                f"Omitted: {len(entries)} conflicted {plural(len(entries), 'file')} "
+                f"is too many to detail here. See the {job_summary_link()}."
+            )
+            out.append("")
+        for entry in shown if budget.detail else ():
             detail = per_file.get(entry["path"], {})
             detail = detail if isinstance(detail, dict) else {}
-            out.append(f"**`{entry['path']}`** \u2014 {entry['type']}")
+            out.append(f"**`{clip(entry['path'], MAX_PATH_CHARS)}`** \u2014 {entry['type']}")
             out.append(f"- Upstream: {str(detail.get('upstream', '')).strip() or NA}")
             out.append(f"- Fork: {str(detail.get('fork', '')).strip() or NA}")
             if entry["status"] == "manual":
-                reason = entry["note"] or NA
+                reason = clip(entry["note"], MAX_SIDE_CHARS) or NA
                 out.append(f"- Resolution: unresolved \u2014 {reason}")
             else:
                 out.append(
@@ -449,26 +501,33 @@ def render_body(prose: dict[str, object] | None, facts: Facts) -> str:
         out.append("</details>")
         out.append("")
 
+    listed = commits[: budget.max_commits] if budget.max_commits else commits
     out.append("<details>")
     out.append(f"<summary>Merged commits ({commit_count})</summary>")
     out.append("")
-    if commits:
-        for sha, subject in commits:
+    if listed:
+        for sha, subject in listed:
+            subject = clip(subject, MAX_SUBJECT_CHARS)
             out.append(f"- `{sha}` {subject}" if subject else f"- `{sha}`")
+        if len(listed) < len(commits):
+            out.append(f"- ... and {len(commits) - len(listed)} more")
     else:
         out.append(f"- {NA}")
     out.append("")
     out.append("</details>")
     out.append("")
 
-    stat = facts.stat
+    stat = facts.stat if budget.stat else ""
     out.append("<details>")
     out.append(f"<summary>Changed files ({files})</summary>")
     out.append("")
-    # Four backticks: a path in the diffstat cannot close the fence early.
-    out.append("````")
-    out.append(stat if stat else NA)
-    out.append("````")
+    if stat:
+        # Four backticks: a path in the diffstat cannot close the fence early.
+        out.append("````")
+        out.append(stat)
+        out.append("````")
+    else:
+        out.append(f"Omitted; see the {job_summary_link()} or the Files changed tab.")
     out.append("")
     out.append("</details>")
     out.append("")
@@ -479,6 +538,20 @@ def render_body(prose: dict[str, object] | None, facts: Facts) -> str:
     out.append("- [ ] `make build` and `make test` pass")
 
     return "\n".join(out).strip()
+
+
+def render_for_budget(prose: dict[str, object] | None, facts: Facts) -> str:
+    """Render at the most generous budget whose output fits the body limit."""
+    body = ""
+    for budget in BUDGETS:
+        body = render_body(prose, facts, budget)
+        if len(body) <= MAX_BODY_CHARS:
+            return body
+        print(
+            f"WARNING: body was {len(body)} chars at budget {budget}; tightening.",
+            file=sys.stderr,
+        )
+    return body
 
 
 def job_summary_link() -> str:
@@ -694,20 +767,22 @@ def sanitize_prose(prose: dict[str, object] | None) -> dict[str, object] | None:
     if not prose:
         return None
 
-    def clean(value: object) -> str:
+    def clean(value: object, limit: int) -> str:
         # Every model slot is a single-line field (title, summary, table cell,
         # bullet). Collapsing whitespace here is what stops a multi-line answer
-        # from splitting a table row or a list item across lines.
+        # from splitting a table row or a list item across lines, and the limit
+        # keeps one verbose answer from dominating the body.
         collapsed = " ".join(str(value).split())
-        return neutralize_issue_closers(strip_emoji_and_controls(collapsed))
+        return clip(neutralize_issue_closers(strip_emoji_and_controls(collapsed)), limit)
 
+    limits = {"resolution": MAX_RESOLUTION_CHARS, "upstream": MAX_SIDE_CHARS, "fork": MAX_SIDE_CHARS}
     conflicts = prose.get("conflicts")
     conflicts = conflicts if isinstance(conflicts, dict) else {}
     return {
-        "title": clean(prose.get("title", "")),
-        "summary": clean(prose.get("summary", "")),
+        "title": clean(prose.get("title", ""), MAX_TITLE_CHARS * 2),
+        "summary": clean(prose.get("summary", ""), MAX_SUMMARY_CHARS),
         "conflicts": {
-            path: {key: clean(value) for key, value in fields.items()}
+            path: {key: clean(value, limits.get(key, MAX_SIDE_CHARS)) for key, value in fields.items()}
             for path, fields in conflicts.items()
         },
     }
@@ -724,9 +799,11 @@ def finalize(title: str, body: str) -> tuple[str, str]:
     if len(title) > MAX_TITLE_CHARS:
         title = title[: MAX_TITLE_CHARS - 3].rstrip() + "..."
 
-    # The body is template-rendered and already sanitized slot by slot; this cap
-    # only guards against a pathological commit list blowing GitHub's hard limit.
+    # Unreachable in practice: the budget ladder in render_for_budget already
+    # bounds the body, and its tightest rung is bounded by the per-field limits.
+    # Kept as a hard stop so a body can never be rejected by the API outright.
     if len(body) > MAX_BODY_CHARS:
+        print(f"WARNING: body still {len(body)} chars after budgeting; hard-truncating.", file=sys.stderr)
         body = body[: MAX_BODY_CHARS - 3].rstrip() + "..."
     return title, body
 
@@ -752,7 +829,7 @@ def main() -> None:
 
     facts = collect_facts()
     try:
-        body = render_body(prose, facts)
+        body = render_for_budget(prose, facts)
     except Exception as exc:  # noqa: BLE001 - a PR must open even if rendering trips
         print(f"WARNING: PR body rendering failed; using the empty skeleton: {exc}", file=sys.stderr)
         prose = None
