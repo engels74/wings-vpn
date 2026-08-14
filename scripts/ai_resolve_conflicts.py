@@ -8,6 +8,11 @@ Run this AFTER a `git merge` that produced conflicts. It will:
   4. `git add` the files it successfully resolved
   5. report a summary to stdout, $GITHUB_STEP_SUMMARY and $GITHUB_OUTPUT
 
+Outputs: `resolved`, `failed`, `failed_files`, and `conflict_details` (a JSON
+array of {path, type, status, note} objects consumed by
+scripts/ai_generate_pr_metadata.py to build the per-file conflict tables in the
+pull request body).
+
 Files it will NOT touch (and instead flags for a human):
   - binary / non-UTF-8 files
   - files larger than MAX_FILE_BYTES (avoids truncated model output)
@@ -114,6 +119,21 @@ SYSTEM_PROMPT = (
 )
 
 
+# `git status --porcelain` XY codes for unmerged index entries, mapped to the
+# human wording used in the PR body's conflict table. The type is what tells a
+# reviewer WHAT the disagreement was (content vs. existence), so it must be read
+# while the entries are still unmerged -- `git add` clears them to stage 0.
+CONFLICT_TYPES = {
+    "DD": "both deleted",
+    "AU": "added by us",
+    "UD": "modify/delete",
+    "UA": "added by them",
+    "DU": "delete/modify",
+    "AA": "both added",
+    "UU": "both modified",
+}
+
+
 def run(args):
     return subprocess.run(args, capture_output=True, text=True, check=True).stdout
 
@@ -121,6 +141,37 @@ def run(args):
 def conflicted_files():
     out = run(["git", "diff", "--name-only", "--diff-filter=U"])
     return [line for line in out.splitlines() if line.strip()]
+
+
+def conflict_types():
+    """Map each unmerged path to its conflict type (e.g. "both modified").
+
+    Best-effort: a failure here only costs the PR body its `Type` column, so it
+    degrades to an empty map rather than raising into the never-crash main().
+    """
+    try:
+        out = run(["git", "status", "--porcelain", "-z", "--untracked-files=no"])
+    except Exception as e:  # noqa: BLE001 - cosmetic metadata must never crash
+        print(f"WARNING: could not read conflict types ({e}).", file=sys.stderr)
+        return {}
+
+    types = {}
+    # -z output is NUL-terminated "XY <path>" records; rename/copy records carry
+    # the original path as a SEPARATE following field, which must be skipped so
+    # it is not misread as the next record.
+    fields = out.split("\0")
+    i = 0
+    while i < len(fields):
+        entry = fields[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        code, path = entry[:2], entry[3:]
+        if code[0] in "RC":
+            i += 1
+        if code in CONFLICT_TYPES:
+            types[path] = CONFLICT_TYPES[code]
+    return types
 
 
 def user_prompt(path, content):
@@ -363,9 +414,16 @@ def main():
             f"opening a PR with the raw conflict state for a human.",
             file=sys.stderr,
         )
+        sentinel = "(could not enumerate conflicts — manual review required)"
         gh_out("resolved", "0")
         gh_out("failed", "1")
-        gh_out("failed_files", "(could not enumerate conflicts — manual review required)")
+        gh_out("failed_files", sentinel)
+        gh_out("conflict_details", json.dumps([{
+            "path": sentinel,
+            "type": "unknown",
+            "status": "manual",
+            "note": f"could not enumerate conflicted files: {e}",
+        }]))
         return
 
     if not files:
@@ -373,11 +431,16 @@ def main():
         gh_out("resolved", "0")
         gh_out("failed", "0")
         gh_out("failed_files", "")
+        gh_out("conflict_details", "[]")
         return
 
     print(f"Conflicted files ({len(files)}): {', '.join(files)}")
 
-    resolved, need_human = [], []
+    # Read the types BEFORE resolving: resolve_file() stages what it fixes, which
+    # clears the unmerged entries this depends on.
+    types = conflict_types()
+
+    resolved, need_human, details = [], [], []
     for path in files:
         print(f"-> {path}")
         if unavailable:
@@ -392,19 +455,28 @@ def main():
             resolved.append(path)
         else:
             need_human.append((path, note))
+        details.append({
+            "path": path,
+            "type": types.get(path, "unknown"),
+            "status": "resolved" if status == "resolved" else "manual",
+            "note": note,
+        })
 
     gh_out("resolved", str(len(resolved)))
     gh_out("failed", str(len(need_human)))
     gh_out("failed_files", ",".join(p for p, _ in need_human))
+    gh_out("conflict_details", json.dumps(details))
 
     summary = ["### AI conflict resolution", ""]
     summary.append(f"- Resolved by model: **{len(resolved)}**")
     summary.append(f"- Need a human: **{len(need_human)}**")
     if resolved:
-        summary += ["", "**Resolved:**"] + [f"- `{p}`" for p in resolved]
+        summary += ["", "**Resolved:**"] + [
+            f"- `{p}` ({types.get(p, 'unknown')})" for p in resolved
+        ]
     if need_human:
         summary += ["", "**Left for you to finish:**"] + [
-            f"- `{p}` — {note}" for p, note in need_human
+            f"- `{p}` ({types.get(p, 'unknown')}) — {note}" for p, note in need_human
         ]
     gh_summary(summary)
     print("\n".join(summary))
