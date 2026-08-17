@@ -58,4 +58,4 @@ allowed_origins:
 
 ## Reporting Issues
 
-Feel free to report fork-specific issues or feature requests in [GitHub Issues](https://github.com/engels74/wings-vpn/issues/new).
+Feel free to report fork-specific issues or feature requests in [GitHub Issues](https://github.com/engels74/wings-vpn/issues/new). For upstream Pelican Wings issues, please use the [upstream issue tracker](https://github.com/pelican/wings/issues/new).
